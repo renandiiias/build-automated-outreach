@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Executa navegador visivel (debug)",
     )
+    parser.add_argument(
+        "--enrich-website",
+        action="store_true",
+        help="Tenta enriquecer lead pelo website (emails/telefones) usando Scrapling quando disponivel",
+    )
     return parser.parse_args()
 
 
@@ -51,6 +56,7 @@ def main() -> int:
         max_results=args.max_results,
         out_format=args.format,
         headless=not args.headful,
+        enrich_website=args.enrich_website,
     )
     for file_path in files:
         print(file_path)

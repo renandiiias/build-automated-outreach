@@ -1,0 +1,2 @@
+# Optional enrichment dependency (recommended for Python 3.10+)
+scrapling[fetchers]>=0.2.99

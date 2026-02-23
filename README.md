@@ -5,6 +5,7 @@ Servico para gerar leads a partir de buscas no Google Maps e exportar CSV/XLSX.
 ## O que foi implementado
 
 - Scraper com Playwright para Google Maps (publico + local)
+- Enriquecimento opcional por website usando Scrapling (quando instalado)
 - Exportacao para CSV e XLSX
 - Logs estruturados JSONL em UTC (`logs/events.jsonl`)
 - Redaction automatica de segredos antes de gravar log
@@ -30,6 +31,14 @@ python -m playwright install chromium
 cp .env.example .env
 ```
 
+### Opcional: enriquecimento com Scrapling
+
+Para extrair contatos adicionais (email/telefone) dos websites dos leads:
+
+```bash
+pip install -r requirements-optional.txt
+```
+
 ## Uso
 
 ```bash
@@ -38,7 +47,8 @@ python scripts/run_leadgen.py \
   --audience "dentistas" \
   --location "Sao Paulo SP" \
   --max-results 50 \
-  --format both
+  --format both \
+  --enrich-website
 ```
 
 Saida em `output/`.
@@ -48,6 +58,7 @@ Saida em `output/`.
 - Eventos: `logs/events.jsonl`
 - Estado de incidente: `logs/incident_state.db`
 - Relatorios: `logs/incidents/incident-*.md`
+- Enriquecimento: eventos `lead_enriched` e `lead_enrichment_failed` com provider usado
 
 ## Deploy no DigitalOcean (Droplet)
 
@@ -73,3 +84,4 @@ bash scripts/deploy_do_safe.sh
 
 - Google Maps pode alterar seletores e limitar automacao. Se quebrar, ajuste `src/leadgen/scraper.py`.
 - Para volume alto e estabilidade, considere fallback com Places API oficial.
+- Se Scrapling nao estiver instalado/indisponivel, o sistema faz fallback automatico para `urllib` no enriquecimento.

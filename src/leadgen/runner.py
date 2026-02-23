@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import get_config
+from .enrichment import enrich_with_website_contacts
 from .exporters import export_csv, export_xlsx
 from .incident import IncidentEngine
 from .logging_utils import JsonlLogger
@@ -28,6 +29,7 @@ class LeadGeneratorRunner:
         max_results: int,
         out_format: str,
         headless: bool,
+        enrich_website: bool,
     ) -> list[Path]:
         run_id = datetime.now(UTC).strftime("run-%Y%m%dT%H%M%SZ")
         self.logger.write(
@@ -38,6 +40,7 @@ class LeadGeneratorRunner:
                 "location": location,
                 "max_results": max_results,
                 "format": out_format,
+                "enrich_website": enrich_website,
             },
         )
 
@@ -50,6 +53,8 @@ class LeadGeneratorRunner:
                     headless=headless,
                 )
             )
+            if enrich_website:
+                rows = enrich_with_website_contacts(rows, self.logger, run_id)
 
             ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             stem = f"leads-{audience.replace(' ', '_')}-{location.replace(' ', '_')}-{ts}"
