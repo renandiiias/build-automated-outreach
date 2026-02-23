@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+logs/*.jsonl
+logs/*.db
+logs/incidents/
+output/
+*.xlsx
+*.csv

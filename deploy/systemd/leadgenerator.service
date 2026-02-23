@@ -1,0 +1,14 @@
+[Unit]
+Description=LeadGenerator Worker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/leadgenerator
+EnvironmentFile=/opt/leadgenerator/.env
+ExecStart=/opt/leadgenerator/.venv/bin/python /opt/leadgenerator/scripts/run_leadgen.py --audience "restaurantes" --location "Sao Paulo" --max-results 20 --format both
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
