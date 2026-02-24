@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--audience", required=True, help="Ex: dentistas")
     parser.add_argument("--location", required=True, help="Ex: Sao Paulo SP")
-    parser.add_argument("--max-results", type=int, default=40, help="Maximo de resultados")
+    parser.add_argument("--max-results", type=int, default=60, help="Maximo de resultados (padrao anti-ban)")
     parser.add_argument(
         "--format",
         default="both",

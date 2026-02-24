@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .config import IncidentPolicy
+from .time_utils import UTC
 
 
 @dataclass

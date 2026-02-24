@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from .config import get_config
@@ -8,7 +8,9 @@ from .enrichment import enrich_with_website_contacts
 from .exporters import export_csv, export_xlsx
 from .incident import IncidentEngine
 from .logging_utils import JsonlLogger
-from .scraper import GoogleMapsScraper, ScrapeRequest
+from .ops_state import OperationalState
+from .scraper import GoogleMapsScraper, ScrapePausedError, ScrapeRequest
+from .time_utils import UTC
 
 
 class LeadGeneratorRunner:
@@ -21,6 +23,7 @@ class LeadGeneratorRunner:
             incident_dir=self.cfg.log_dir / "incidents",
         )
         self.scraper = GoogleMapsScraper()
+        self.ops = OperationalState(self.cfg.ops_state_db)
 
     def run(
         self,
@@ -45,7 +48,7 @@ class LeadGeneratorRunner:
         )
 
         try:
-            rows = self.scraper.scrape(
+            result = self.scraper.scrape(
                 ScrapeRequest(
                     audience=audience,
                     location=location,
@@ -53,6 +56,7 @@ class LeadGeneratorRunner:
                     headless=headless,
                 )
             )
+            rows = result.rows
             if enrich_website:
                 rows = enrich_with_website_contacts(rows, self.logger, run_id)
 
@@ -65,15 +69,32 @@ class LeadGeneratorRunner:
             if out_format in {"xlsx", "both"}:
                 files.append(export_xlsx(rows, self.cfg.output_dir / f"{stem}.xlsx"))
 
+            self.ops.record_run(run_id, "SCRAPE", unstable=result.unstable, reason="risk_signals" if result.unstable else "ok")
+
             self.logger.write(
                 "run_finished",
                 {
                     "run_id": run_id,
                     "rows": len(rows),
                     "files": [str(f) for f in files],
+                    "captcha_events": result.captcha_events,
+                    "timeout_events": result.timeout_events,
+                    "http_429_events": result.http_429_events,
                 },
             )
             return files
+        except ScrapePausedError as exc:
+            self.ops.record_run(run_id, "SCRAPE", unstable=True, reason=str(exc))
+            self.ops.set_channel_paused("SCRAPE", "error_streak", cooldown_hours=12)
+            self.logger.write(
+                "channel_paused",
+                {
+                    "run_id": run_id,
+                    "channel": "SCRAPE",
+                    "reason": str(exc),
+                },
+            )
+            return []
         except Exception as exc:
             message = str(exc)
             error_type = exc.__class__.__name__

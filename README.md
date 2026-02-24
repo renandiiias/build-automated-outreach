@@ -1,24 +1,37 @@
-# LeadGenerator (Google Maps -> Planilha)
+# LeadGenerator (Google Maps -> Consentimento -> Demo -> Oferta)
 
-Servico para gerar leads a partir de buscas no Google Maps e exportar CSV/XLSX.
+Servico de leadgen com foco em negocios no Google Maps sem website, com protecao anti-ban, outreach por email (Resend) e fallback WhatsApp (WPPConnect).
 
 ## O que foi implementado
 
-- Scraper com Playwright para Google Maps (publico + local)
-- Enriquecimento opcional por website usando Scrapling (quando instalado)
-- Exportacao para CSV e XLSX
-- Logs estruturados JSONL em UTC (`logs/events.jsonl`)
-- Redaction automatica de segredos antes de gravar log
-- Fingerprint de erro (`error_type + message + stack + contexto`)
-- Escalonamento de incidente (L0, L1, L2, L3)
-- Relatorio automatico `incident-<fingerprint>-<timestamp>.md` para incidentes >= L2
-- Script de deploy seguro para DigitalOcean com:
-  - precheck
-  - backup remoto
-  - deploy
-  - postcheck
-  - validacao Expo
-  - rollback automatico em falha
+- Scraper Google Maps com anti-ban pratico:
+  - delay aleatorio por acao
+  - pausa longa a cada bloco de resultados
+  - deteccao de risco (captcha/timeout/429)
+  - pausa automatica `SCRAPE_PAUSED` por streak de erro
+- Pipeline operacional com estado em SQLite:
+  - `logs/pipeline_state.db` (leads, touches, replies, opt-outs)
+  - `logs/ops_state.db` (status de canais, metricas diarias, safe mode)
+- Outreach consent-first:
+  - primeiro contato sem links
+  - email via Resend
+  - fallback WhatsApp via WPPConnect quando nao houver email
+- Opt-out obrigatorio:
+  - unsubscribe por link no email
+  - comando `PARAR/STOP` no WhatsApp
+  - supressao por hash de contato
+- Geracao de demo custom por lead:
+  - publica em diretorio de preview no servidor
+  - usa OpenAI quando `OPENAI_API_KEY` existe
+  - fallback local sem IA quando necessario
+- Envio de oferta apos aceite:
+  - preview + pagamento
+- Kill-switch automatico:
+  - `EMAIL_PAUSED`, `WHATSAPP_PAUSED`, `SCRAPE_PAUSED`
+  - `GLOBAL_SAFE_MODE` quando >= 2 canais pausados
+- Logs JSONL em UTC com redaction automatica de segredos
+- Fingerprint de incidente e escalonamento L0-L3
+- Script de deploy seguro DigitalOcean com rollback
 
 ## Instalacao local
 
@@ -31,39 +44,71 @@ python -m playwright install chromium
 cp .env.example .env
 ```
 
-### Opcional: enriquecimento com Scrapling
-
-Para extrair contatos adicionais (email/telefone) dos websites dos leads:
+## Comando legado (so scraping + export)
 
 ```bash
-pip install -r requirements-optional.txt
-```
-
-## Uso
-
-```bash
-source .venv/bin/activate
 python scripts/run_leadgen.py \
-  --audience "dentistas" \
+  --audience "eletricistas" \
   --location "Sao Paulo SP" \
-  --max-results 50 \
+  --max-results 60 \
   --format both \
   --enrich-website
 ```
 
-Saida em `output/`.
+## Pipeline completo
+
+### One-shot
+
+```bash
+python scripts/run_pipeline.py run-all \
+  --audience "encanadores" \
+  --location "Sao Paulo SP" \
+  --max-results 60 \
+  --payment-url "https://pay.example/checkout/abc"
+```
+
+### Etapas separadas
+
+```bash
+python scripts/run_pipeline.py ingest --audience "eletricistas" --location "Sao Paulo SP"
+python scripts/run_pipeline.py outreach --run-id manual
+python scripts/run_pipeline.py followups --run-id manual
+python scripts/run_pipeline.py reply --lead-id 42 --channel WHATSAPP --text "sim pode enviar"
+python scripts/run_pipeline.py offers --run-id manual --payment-url "https://pay.example/checkout/abc"
+python scripts/run_pipeline.py email-feedback --sent 120 --bounces 8 --complaints 1
+```
+
+## Politica anti-ban aplicada
+
+- Scraping:
+  - 1 sessao ativa por run
+  - delay aleatorio (1.8s-4.2s)
+  - pausa longa por bloco de 20
+  - pausa do canal por 12h em caso de erro repetido/captcha
+- Email:
+  - warm-up diario (30 -> 60 -> +20 por degrau)
+  - pausa automatica com bounce > 5% ou complaint > 0.3%
+- WhatsApp:
+  - somente fallback quando email ausente
+  - pausa automatica quando falha > 10%
+- Kill-switch:
+  - quando 2+ canais pausados, entra `GLOBAL_SAFE_MODE`
+  - safe mode bloqueia novos envios, mantendo ingestao e processamento
 
 ## Logs e incidentes
 
 - Eventos: `logs/events.jsonl`
-- Estado de incidente: `logs/incident_state.db`
-- Relatorios: `logs/incidents/incident-*.md`
-- Enriquecimento: eventos `lead_enriched` e `lead_enrichment_failed` com provider usado
+- Incidentes: `logs/incident_state.db` + `logs/incidents/incident-*.md`
+- Estado operacional: `logs/ops_state.db`
+- Estado CRM/pipeline: `logs/pipeline_state.db`
 
-## Deploy no DigitalOcean (Droplet)
+Eventos adicionais importantes:
+- `channel_paused`, `channel_resumed`
+- `safe_mode_enabled`, `safe_mode_disabled`
+- `captcha_detected`, `deliverability_alert`
+- `contact_delivered`, `contact_failed`, `reply_received`, `opt_out_registered`
 
-1. Configure `.env` remoto e unit file do systemd.
-2. Exporte variaveis locais:
+## Deploy no DigitalOcean
 
 ```bash
 export DO_SSH_TARGET="root@SEU_IP"
@@ -72,16 +117,8 @@ export SERVICE_NAME="leadgenerator"
 export PRE_HEALTHCHECK_URL="https://seu-backend/health"
 export POST_HEALTHCHECK_URL="https://seu-backend/health"
 export EXPO_CHECK_URL="https://seu-expo/status"
-```
 
-3. Execute deploy:
-
-```bash
 bash scripts/deploy_do_safe.sh
 ```
 
-## Observacoes importantes
-
-- Google Maps pode alterar seletores e limitar automacao. Se quebrar, ajuste `src/leadgen/scraper.py`.
-- Para volume alto e estabilidade, considere fallback com Places API oficial.
-- Se Scrapling nao estiver instalado/indisponivel, o sistema faz fallback automatico para `urllib` no enriquecimento.
+O script executa: precheck -> backup -> deploy -> postcheck -> expo check -> rollback automatico em falha.

@@ -18,6 +18,9 @@ class IncidentPolicy:
 class AppConfig:
     log_dir: Path = Path(os.getenv("LEADGEN_LOG_DIR", "./logs"))
     output_dir: Path = Path(os.getenv("LEADGEN_OUTPUT_DIR", "./output"))
+    state_db: Path = Path(os.getenv("LEADGEN_STATE_DB", "./logs/pipeline_state.db"))
+    ops_state_db: Path = Path(os.getenv("LEADGEN_OPS_STATE_DB", "./logs/ops_state.db"))
+    preview_dir: Path = Path(os.getenv("LEADGEN_PREVIEW_DIR", "./output/previews"))
     timezone: str = os.getenv("LEADGEN_TIMEZONE", "UTC")
     incident: IncidentPolicy = IncidentPolicy()
 
@@ -26,5 +29,8 @@ def get_config() -> AppConfig:
     cfg = AppConfig()
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    cfg.preview_dir.mkdir(parents=True, exist_ok=True)
+    cfg.state_db.parent.mkdir(parents=True, exist_ok=True)
+    cfg.ops_state_db.parent.mkdir(parents=True, exist_ok=True)
     (cfg.log_dir / "incidents").mkdir(parents=True, exist_ok=True)
     return cfg
