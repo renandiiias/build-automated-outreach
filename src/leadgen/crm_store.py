@@ -207,6 +207,18 @@ class CrmStore:
             return "", ""
         return str(row[0] or ""), str(row[1] or "")
 
+    def get_lead_id_by_email(self, email: str) -> int | None:
+        if not email:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM leads WHERE lower(email)=lower(?) ORDER BY id DESC LIMIT 1",
+                (email.strip(),),
+            ).fetchone()
+        if not row:
+            return None
+        return int(row[0])
+
     def get_preview_and_payment(self, lead_id: int) -> tuple[str, str]:
         with self._connect() as conn:
             row = conn.execute("SELECT preview_url, payment_url FROM leads WHERE id=?", (lead_id,)).fetchone()

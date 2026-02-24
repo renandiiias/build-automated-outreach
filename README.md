@@ -122,3 +122,15 @@ bash scripts/deploy_do_safe.sh
 ```
 
 O script executa: precheck -> backup -> deploy -> postcheck -> expo check -> rollback automatico em falha.
+
+## Webhook inbound (Resend)
+
+Endpoint esperado para respostas de email:
+
+- `POST /webhooks/resend-inbound`
+
+Esse endpoint classifica a resposta e atualiza o lead:
+
+- `positive` -> `CONSENTED`
+- `opt_out` -> `UNSUBSCRIBED`
+- demais -> `WAITING_REPLY`
