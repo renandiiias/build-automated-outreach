@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlparse
 from .config import get_config
 from .crm_store import CrmStore
 from .logging_utils import JsonlLogger
+from .monitor_dashboard import build_snapshot, render_dashboard_html
 from .outreach import classify_reply, is_opt_out_reply
 
 
@@ -18,6 +19,12 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self._send_json(200, {"status": "ok"})
+            return
+        if parsed.path == "/api/status":
+            self._send_json(200, build_snapshot())
+            return
+        if parsed.path in {"/dashboard", "/"}:
+            self._send_html(200, render_dashboard_html())
             return
 
         if parsed.path == "/unsubscribe":
@@ -62,6 +69,14 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         raw = json.dumps(payload).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_html(self, code: int, html: str) -> None:
+        raw = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)

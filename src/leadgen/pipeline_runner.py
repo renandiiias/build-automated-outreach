@@ -167,6 +167,16 @@ class LeadPipelineRunner:
             self.logger.write("channel_paused", {"run_id": run_id, "channel": "SCRAPE", "reason": str(exc)})
             self._evaluate_global_safe_mode(run_id)
             return 0
+        except Exception as exc:
+            reason = f"SCRAPE_RUNTIME_ERROR:{type(exc).__name__}"
+            self.ops.record_run(run_id, "SCRAPE", unstable=True, reason=reason)
+            self.ops.set_channel_paused("SCRAPE", "runtime_error", cooldown_hours=12)
+            self.logger.write(
+                "channel_paused",
+                {"run_id": run_id, "channel": "SCRAPE", "reason": reason, "detail": str(exc)[:220]},
+            )
+            self._evaluate_global_safe_mode(run_id)
+            return 0
 
     def send_initial_outreach(self, run_id: str) -> int:
         if self.ops.global_safe_mode_enabled():

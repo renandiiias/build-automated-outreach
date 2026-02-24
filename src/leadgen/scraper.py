@@ -55,13 +55,28 @@ class GoogleMapsScraper:
             browser = p.chromium.launch(headless=req.headless)
             context = browser.new_context()
             page = context.new_page()
-            page.goto("https://www.google.com/maps", timeout=90000)
-            self._random_pause(req)
-
-            search_box = page.locator('input#searchboxinput')
-            search_box.fill(query)
-            page.keyboard.press("Enter")
-            self._random_pause(req)
+            try:
+                page.goto("https://www.google.com/maps", timeout=90000)
+                self._random_pause(req)
+                self._accept_possible_consent(page)
+                self._fill_search_query(page, query)
+                page.keyboard.press("Enter")
+                self._random_pause(req)
+            except PlaywrightTimeoutError:
+                runtime.timeout_events += 1
+                runtime.consecutive_errors += 1
+                runtime.consecutive_error_peak = max(runtime.consecutive_error_peak, runtime.consecutive_errors)
+                self._assert_not_paused(req, runtime)
+                return ScrapeResult(
+                    rows=[],
+                    paused=False,
+                    pause_reason="",
+                    captcha_events=runtime.captcha_events,
+                    timeout_events=runtime.timeout_events,
+                    http_429_events=runtime.http_429_events,
+                    consecutive_error_peak=runtime.consecutive_error_peak,
+                    unstable=True,
+                )
 
             self._load_more_results(page, req.max_results, req, runtime)
 
@@ -112,6 +127,41 @@ class GoogleMapsScraper:
             consecutive_error_peak=runtime.consecutive_error_peak,
             unstable=unstable,
         )
+
+    def _fill_search_query(self, page: Page, query: str) -> None:
+        selectors = [
+            'input#searchboxinput',
+            'input[aria-label*="Pesquisar"]',
+            'input[aria-label*="Search Google Maps"]',
+            'input[placeholder*="Pesquisar"]',
+            'input[placeholder*="Search"]',
+        ]
+        for selector in selectors:
+            loc = page.locator(selector).first
+            try:
+                loc.wait_for(state="visible", timeout=12000)
+                loc.fill(query, timeout=15000)
+                return
+            except Exception:
+                continue
+        raise PlaywrightTimeoutError("searchbox_not_found")
+
+    def _accept_possible_consent(self, page: Page) -> None:
+        consent_labels = [
+            "Aceitar tudo",
+            "I agree",
+            "Accept all",
+            "Concordo",
+        ]
+        for label in consent_labels:
+            btn = page.get_by_role("button", name=label).first
+            try:
+                if btn.count() > 0:
+                    btn.click(timeout=2000)
+                    time.sleep(1.0)
+                    return
+            except Exception:
+                continue
 
     def _load_more_results(self, page: Page, max_results: int, req: ScrapeRequest, runtime: ScrapeRuntime) -> None:
         panel = page.locator('div[role="feed"]')
