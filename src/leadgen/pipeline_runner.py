@@ -672,6 +672,8 @@ class LeadPipelineRunner:
             self.logger.write("deliverability_alert", {"run_id": run_id, "channel": "EMAIL", "reason": reason})
 
     def _evaluate_whatsapp_health(self, run_id: str) -> None:
+        if self.email_only:
+            return
         metrics = self.ops.get_channel_metrics("WHATSAPP")
         pause, reason = should_pause_whatsapp(metrics.fail_rate, self.thresholds)
         if pause:
@@ -688,7 +690,8 @@ class LeadPipelineRunner:
             )
 
     def _evaluate_global_safe_mode(self, run_id: str) -> None:
-        paused_count = self.ops.count_paused_channels(["EMAIL", "WHATSAPP", "SCRAPE"])
+        channels = ["EMAIL", "SCRAPE"] if self.email_only else ["EMAIL", "WHATSAPP", "SCRAPE"]
+        paused_count = self.ops.count_paused_channels(channels)
         should_enable = should_enable_global_safe_mode(paused_count, self.thresholds)
         current = self.ops.global_safe_mode_enabled()
         if should_enable and not current:
