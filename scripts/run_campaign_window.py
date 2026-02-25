@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import signal
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="Qtd de ciclos seguidos sem ingestao para trocar para proxima localidade",
     )
+    parser.add_argument(
+        "--ingest-timeout-seconds",
+        type=int,
+        default=480,
+        help="Tempo maximo para etapa de ingestao por ciclo; ao exceder, reinicia o processo",
+    )
+    parser.add_argument(
+        "--outreach-timeout-seconds",
+        type=int,
+        default=240,
+        help="Tempo maximo para cada etapa de outreach por ciclo; ao exceder, reinicia o processo",
+    )
     return parser
 
 
@@ -101,6 +114,27 @@ def build_audience_variants(audience: str) -> list[str]:
         seen.add(key)
         dedup.append(item.strip())
     return dedup or [base]
+
+
+class _StepTimeoutError(TimeoutError):
+    pass
+
+
+def _run_with_timeout(seconds: int, fn, *args, **kwargs):
+    if seconds <= 0:
+        return fn(*args, **kwargs)
+
+    def _handler(_signum, _frame):
+        raise _StepTimeoutError("step_timeout")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def main() -> int:
@@ -150,19 +184,84 @@ def main() -> int:
                 "location_variant": location_now,
             },
         )
-        ingested = runner.ingest(
-            run_id=cycle_id,
-            audience=audience_now,
-            location=location_now,
-            max_results=args.max_results,
-            headless=not args.headful,
-            enrich_website=args.enrich_website,
-        )
-        consent = runner.send_initial_outreach(run_id=cycle_id)
-        followups = runner.send_followups(run_id=cycle_id)
+        runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "ingest"})
+        try:
+            ingested = _run_with_timeout(
+                args.ingest_timeout_seconds,
+                runner.ingest,
+                run_id=cycle_id,
+                audience=audience_now,
+                location=location_now,
+                max_results=args.max_results,
+                headless=not args.headful,
+                enrich_website=args.enrich_website,
+            )
+        except _StepTimeoutError:
+            runner.logger.write(
+                "campaign_step_timeout",
+                {
+                    "run_id": run_id,
+                    "cycle_id": cycle_id,
+                    "step": "ingest",
+                    "timeout_seconds": args.ingest_timeout_seconds,
+                },
+            )
+            raise SystemExit(75)
+        runner.logger.write("campaign_step_finished", {"run_id": run_id, "cycle_id": cycle_id, "step": "ingest", "ingested": ingested})
+
+        runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_initial_outreach"})
+        try:
+            consent = _run_with_timeout(args.outreach_timeout_seconds, runner.send_initial_outreach, run_id=cycle_id)
+        except _StepTimeoutError:
+            runner.logger.write(
+                "campaign_step_timeout",
+                {
+                    "run_id": run_id,
+                    "cycle_id": cycle_id,
+                    "step": "send_initial_outreach",
+                    "timeout_seconds": args.outreach_timeout_seconds,
+                },
+            )
+            raise SystemExit(75)
+        runner.logger.write("campaign_step_finished", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_initial_outreach", "sent": consent})
+
+        runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_followups"})
+        try:
+            followups = _run_with_timeout(args.outreach_timeout_seconds, runner.send_followups, run_id=cycle_id)
+        except _StepTimeoutError:
+            runner.logger.write(
+                "campaign_step_timeout",
+                {
+                    "run_id": run_id,
+                    "cycle_id": cycle_id,
+                    "step": "send_followups",
+                    "timeout_seconds": args.outreach_timeout_seconds,
+                },
+            )
+            raise SystemExit(75)
+        runner.logger.write("campaign_step_finished", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_followups", "sent": followups})
         offers = 0
         if args.payment_url:
-            offers = runner.send_offers_for_consented(run_id=cycle_id, payment_url=args.payment_url)
+            runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_offers_for_consented"})
+            try:
+                offers = _run_with_timeout(
+                    args.outreach_timeout_seconds,
+                    runner.send_offers_for_consented,
+                    run_id=cycle_id,
+                    payment_url=args.payment_url,
+                )
+            except _StepTimeoutError:
+                runner.logger.write(
+                    "campaign_step_timeout",
+                    {
+                        "run_id": run_id,
+                        "cycle_id": cycle_id,
+                        "step": "send_offers_for_consented",
+                        "timeout_seconds": args.outreach_timeout_seconds,
+                    },
+                )
+                raise SystemExit(75)
+            runner.logger.write("campaign_step_finished", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_offers_for_consented", "sent": offers})
 
         totals["ingested"] += ingested
         totals["consent_sent"] += consent
