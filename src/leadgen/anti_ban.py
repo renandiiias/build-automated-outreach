@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 
@@ -13,12 +14,21 @@ class AntiBanThresholds:
 
 
 def email_warmup_daily_limit(day_index: int) -> int:
+    # Optional override for operations that need a fixed daily floor/cap.
+    floor = int(os.getenv("LEADGEN_EMAIL_DAILY_FLOOR", "0") or "0")
+    fixed = int(os.getenv("LEADGEN_EMAIL_DAILY_LIMIT", "0") or "0")
+
+    if fixed > 0:
+        return max(fixed, floor)
+
     if day_index <= 3:
-        return 30
-    if day_index <= 7:
-        return 60
-    extra_weeks = max(0, (day_index - 8) // 7)
-    return 80 + (extra_weeks * 20)
+        base = 30
+    elif day_index <= 7:
+        base = 60
+    else:
+        extra_weeks = max(0, (day_index - 8) // 7)
+        base = 80 + (extra_weeks * 20)
+    return max(base, floor)
 
 
 def should_pause_email(bounce_rate: float, complaint_rate: float, cfg: AntiBanThresholds) -> tuple[bool, str]:
