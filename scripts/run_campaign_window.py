@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import re
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -137,6 +139,52 @@ def _run_with_timeout(seconds: int, fn, *args, **kwargs):
         signal.signal(signal.SIGALRM, previous_handler)
 
 
+def _run_ingest_subprocess(
+    *,
+    audience: str,
+    location: str,
+    max_results: int,
+    headful: bool,
+    enrich_website: bool,
+    timeout_seconds: int,
+) -> int:
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "run_pipeline.py"),
+        "ingest",
+        "--audience",
+        audience,
+        "--location",
+        location,
+        "--max-results",
+        str(max_results),
+    ]
+    if headful:
+        cmd.append("--headful")
+    if enrich_website:
+        cmd.append("--enrich-website")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout_seconds),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _StepTimeoutError("ingest_subprocess_timeout") from exc
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        raise RuntimeError(f"ingest_subprocess_failed rc={proc.returncode} stderr={stderr} stdout={stdout}")
+    output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    match = re.search(r"ingested=(\d+)", output)
+    if not match:
+        return 0
+    return int(match.group(1))
+
+
 def main() -> int:
     load_dotenv()
     args = build_parser().parse_args()
@@ -186,15 +234,13 @@ def main() -> int:
         )
         runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "ingest"})
         try:
-            ingested = _run_with_timeout(
-                args.ingest_timeout_seconds,
-                runner.ingest,
-                run_id=cycle_id,
+            ingested = _run_ingest_subprocess(
                 audience=audience_now,
                 location=location_now,
                 max_results=args.max_results,
-                headless=not args.headful,
+                headful=args.headful,
                 enrich_website=args.enrich_website,
+                timeout_seconds=args.ingest_timeout_seconds,
             )
         except _StepTimeoutError:
             runner.logger.write(
