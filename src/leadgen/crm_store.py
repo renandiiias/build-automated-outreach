@@ -217,7 +217,20 @@ class CrmStore:
                 )
                 """
             )
+            self._migrate_schema(conn)
             conn.commit()
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        lead_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(leads)").fetchall()}
+        migrations: list[tuple[str, str]] = [
+            ("sale_amount", "ALTER TABLE leads ADD COLUMN sale_amount REAL NOT NULL DEFAULT 0"),
+            ("accepted_plan", "ALTER TABLE leads ADD COLUMN accepted_plan TEXT NOT NULL DEFAULT ''"),
+            ("won_at_utc", "ALTER TABLE leads ADD COLUMN won_at_utc TEXT NOT NULL DEFAULT ''"),
+            ("lost_at_utc", "ALTER TABLE leads ADD COLUMN lost_at_utc TEXT NOT NULL DEFAULT ''"),
+        ]
+        for col, sql in migrations:
+            if col not in lead_cols:
+                conn.execute(sql)
 
     def upsert_lead_from_row(self, run_id: str, row: dict[str, Any]) -> int:
         now = self._now().isoformat()
