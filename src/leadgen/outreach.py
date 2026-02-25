@@ -39,6 +39,8 @@ class ResendEmailClient:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "leadgen-outreach/1.0",
             },
         )
         try:
