@@ -120,8 +120,9 @@ def initial_consent_email(name: str, unsubscribe_url: str, variant: int = 1, cit
 
 def initial_consent_whatsapp(name: str) -> str:
     return (
-        f"Oi, equipe {name}. Vi o perfil de voces no Google e posso montar uma demo gratis de pagina para captar mais contatos. "
-        "Posso te enviar? Se nao quiser receber mensagens, responda PARAR."
+        f"Oi, {name}! Tudo bem? "
+        "Vi o perfil de voces no Google e posso montar uma demo gratis, bem rapida, pra trazer mais contatos. "
+        "Quer que eu te envie? Se nao quiser receber mensagens, responde PARAR."
     )
 
 
@@ -154,11 +155,11 @@ def followup_consent_whatsapp(name: str, step: int) -> str:
     if step >= 2:
         return (
             f"{name}, ultimo toque por aqui sobre a demo gratis. "
-            "Se quiser receber, responda SIM. Para sair, responda PARAR."
+            "Se quiser, me responde SIM que eu envio ainda hoje. Se preferir nao receber mais, responde PARAR."
         )
     return (
         f"{name}, posso seguir com a demo gratis da sua pagina? "
-        "Se nao quiser mais mensagens, responda PARAR."
+        "Se quiser eu ja preparo agora. Se nao quiser mais mensagens, responde PARAR."
     )
 
 
@@ -226,9 +227,13 @@ def offer_followup_email(name: str, unsubscribe_url: str, step: int) -> tuple[st
 
 def offer_whatsapp(name: str, preview_url: str, payment_url: str) -> str:
     return (
-        f"{name}, sua demo ficou pronta: {preview_url}. "
-        f"Se quiser que eu publique a versao final hoje, segue pagamento: {payment_url}. "
-        "Se quiser parar as mensagens, responda PARAR."
+        f"{name}, ficou pronta a sua demo: {preview_url}\n\n"
+        "Tenho 2 opcoes para publicar hoje:\n"
+        "- COMPLETO\n"
+        "- SIMPLES\n\n"
+        "Se quiser, te mando o link de pagamento agora: "
+        f"{payment_url}\n\n"
+        "Se nao quiser mais mensagens, responde PARAR."
     )
 
 
