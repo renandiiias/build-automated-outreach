@@ -16,6 +16,7 @@ from .config import get_config
 from .crm_store import CrmStore
 from .demo_site import DemoSiteBuilder, slugify
 from .enrichment import enrich_with_website_contacts
+from .incident import IncidentEngine
 from .logging_utils import JsonlLogger
 from .ops_state import OperationalState
 from .outreach import (
@@ -53,6 +54,11 @@ class LeadPipelineRunner:
         self.scraper = GoogleMapsScraper()
         self.store = CrmStore(self.cfg.state_db)
         self.ops = OperationalState(self.cfg.ops_state_db)
+        self.incident_engine = IncidentEngine(
+            db_path=self.cfg.log_dir / "incident_state.db",
+            policy=self.cfg.incident,
+            incident_dir=self.cfg.log_dir / "incidents",
+        )
         self.thresholds = AntiBanThresholds()
         self.email_client = get_resend_client_from_env()
         self.wa_client = get_wpp_client_from_env()
@@ -61,6 +67,7 @@ class LeadPipelineRunner:
         self.demo_builder = DemoSiteBuilder(base_url=preview_base, publish_dir=preview_dir)
         self.unsubscribe_base = os.getenv("UNSUBSCRIBE_BASE_URL", preview_base)
         self.wa_daily_limit = int(os.getenv("LEADGEN_WA_DAILY_LIMIT", "40"))
+        self.allow_relaxed_icp = os.getenv("LEADGEN_ALLOW_RELAXED_ICP", "1").strip().lower() in {"1", "true", "yes", "on"}
 
     def run_all(
         self,
@@ -126,9 +133,28 @@ class LeadPipelineRunner:
             if enrich_website:
                 rows = enrich_with_website_contacts(rows, self.logger, run_id)
 
-            for row in rows:
-                if str(row.get("website", "")).strip():
-                    continue
+            rows_qualified = [row for row in rows if not str(row.get("website", "")).strip()]
+            relaxed = False
+            if not rows_qualified and self.allow_relaxed_icp:
+                # Fallback pragmatica: se zero sem-site, permite leads com telefone/email para nao travar a run.
+                rows_qualified = [
+                    row
+                    for row in rows
+                    if str(row.get("phone", "")).strip() or str(row.get("website_emails", "")).strip()
+                ]
+                relaxed = True
+                self.logger.write(
+                    "icp_relaxed_mode_enabled",
+                    {
+                        "run_id": run_id,
+                        "reason": "no_website_leads_found",
+                        "strict_candidates": 0,
+                        "relaxed_candidates": len(rows_qualified),
+                    },
+                )
+
+            leads_before = self.store.count_leads()
+            for row in rows_qualified:
                 lead_id = self.store.upsert_lead_from_row(run_id, row)
                 self.store.update_stage(lead_id, "QUALIFIED")
                 self.logger.write(
@@ -137,9 +163,21 @@ class LeadPipelineRunner:
                         "run_id": run_id,
                         "lead_id": lead_id,
                         "business_name": row.get("name", ""),
+                        "qualified_mode": "RELAXED" if relaxed else "STRICT",
                         "channel_selected": "EMAIL" if str(row.get("website_emails", "")).strip() else "WHATSAPP",
                     },
                 )
+            leads_after = self.store.count_leads()
+            new_leads = max(0, leads_after - leads_before)
+            self.logger.write(
+                "ingest_summary",
+                {
+                    "run_id": run_id,
+                    "qualified_rows": len(rows_qualified),
+                    "new_leads": new_leads,
+                    "mode": "RELAXED" if relaxed else "STRICT",
+                },
+            )
 
             self.ops.record_run(run_id, "SCRAPE", unstable=result.unstable, reason="risk_signals" if result.unstable else "ok")
             self.logger.write(
@@ -160,11 +198,17 @@ class LeadPipelineRunner:
                 self.logger.write("channel_paused", {"run_id": run_id, "channel": "SCRAPE", "reason": "unstable_runs"})
 
             self._evaluate_global_safe_mode(run_id)
-            return len(rows)
+            return new_leads
         except ScrapePausedError as exc:
             self.ops.record_run(run_id, "SCRAPE", unstable=True, reason=str(exc))
             self.ops.set_channel_paused("SCRAPE", "error_streak", cooldown_hours=12)
             self.logger.write("channel_paused", {"run_id": run_id, "channel": "SCRAPE", "reason": str(exc)})
+            self._register_incident(
+                run_id=run_id,
+                error_type="ScrapePausedError",
+                message=str(exc),
+                context={"stage": "ingest", "audience": audience, "location": location},
+            )
             self._evaluate_global_safe_mode(run_id)
             return 0
         except Exception as exc:
@@ -174,6 +218,12 @@ class LeadPipelineRunner:
             self.logger.write(
                 "channel_paused",
                 {"run_id": run_id, "channel": "SCRAPE", "reason": reason, "detail": str(exc)[:220]},
+            )
+            self._register_incident(
+                run_id=run_id,
+                error_type=type(exc).__name__,
+                message=str(exc),
+                context={"stage": "ingest", "audience": audience, "location": location},
             )
             self._evaluate_global_safe_mode(run_id)
             return 0
@@ -461,3 +511,48 @@ class LeadPipelineRunner:
         now = datetime.now(UTC)
         delta = now.date() - first.date()
         return max(1, delta.days + 1)
+
+    def _register_incident(self, run_id: str, error_type: str, message: str, context: dict[str, str]) -> None:
+        merged_context = {"run_id": run_id, **context}
+        fingerprint = self.incident_engine.fingerprint(
+            error_type=error_type,
+            message=message,
+            stack="pipeline_runner.ingest",
+            context=merged_context,
+        )
+        state = self.incident_engine.register(
+            fingerprint=fingerprint,
+            error_type=error_type,
+            message=message,
+        )
+        self.logger.write(
+            "incident_registered",
+            {
+                "run_id": run_id,
+                "fingerprint": fingerprint,
+                "level": state.level,
+                "count_window": state.count_window,
+                "error_type": error_type,
+                "message": message[:200],
+            },
+        )
+        if state.should_generate_report:
+            report = self.incident_engine.write_report(
+                state=state,
+                error_type=error_type,
+                message=message,
+                context=merged_context,
+                attempts=["ingest run", "selector fallback", "auto pause channel"],
+                impact="Ingestao de leads degradada ou interrompida.",
+                hypothesis="Mudanca de layout no Google Maps, latencia de rede, ou anti-bot temporario.",
+                next_steps=[
+                    "Reduzir volume e aumentar delay de scraping",
+                    "Revalidar seletores e fallback de busca",
+                    "Executar nova janela apos cooldown",
+                ],
+                status="open",
+            )
+            self.logger.write(
+                "incident_report_generated",
+                {"run_id": run_id, "fingerprint": fingerprint, "level": state.level, "report_path": str(report)},
+            )

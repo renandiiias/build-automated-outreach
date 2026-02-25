@@ -7,10 +7,18 @@ set -euo pipefail
 # SERVICE_NAME=leadgenerator
 # Optional envs:
 # PRE_HEALTHCHECK_URL, POST_HEALTHCHECK_URL, EXPO_CHECK_URL
+# DO_SSH_OPTS='-i ~/.ssh/key -o StrictHostKeyChecking=accept-new'
 
 : "${DO_SSH_TARGET:?missing DO_SSH_TARGET}"
 : "${REMOTE_DIR:?missing REMOTE_DIR}"
 : "${SERVICE_NAME:?missing SERVICE_NAME}"
+DO_SSH_OPTS="${DO_SSH_OPTS:-}"
+SSH_CMD=(ssh)
+if [[ -n "$DO_SSH_OPTS" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_OPTS=($DO_SSH_OPTS)
+  SSH_CMD+=( "${EXTRA_OPTS[@]}" )
+fi
 
 TS_UTC() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 LOG_JSON() {
@@ -30,7 +38,7 @@ run_healthcheck() {
 
 rollback() {
   LOG_JSON "rollback" "started" "Rolling back from latest backup"
-  ssh "$DO_SSH_TARGET" "set -e; cd '$REMOTE_DIR'; if ls backup-*.tgz >/dev/null 2>&1; then latest=\$(ls -1t backup-*.tgz | head -n1); tar -xzf \"$latest\"; fi; sudo systemctl restart '$SERVICE_NAME'"
+  "${SSH_CMD[@]}" "$DO_SSH_TARGET" "set -e; cd '$REMOTE_DIR'; if ls backup-*.tgz >/dev/null 2>&1; then latest=\$(ls -1t backup-*.tgz | head -n1); tar -xzf \"$latest\"; fi; sudo systemctl restart '$SERVICE_NAME'"
   LOG_JSON "rollback" "finished" "Rollback completed"
 }
 
@@ -41,12 +49,20 @@ run_healthcheck "${PRE_HEALTHCHECK_URL:-}"
 LOG_JSON "precheck" "finished" "Pre-deploy checks passed"
 
 LOG_JSON "backup" "started" "Creating remote backup"
-ssh "$DO_SSH_TARGET" "set -e; mkdir -p '$REMOTE_DIR'; cd '$REMOTE_DIR'; tar -czf backup-$(date -u +%Y%m%dT%H%M%SZ).tgz src scripts requirements.txt .env 2>/dev/null || true"
+"${SSH_CMD[@]}" "$DO_SSH_TARGET" "set -e; mkdir -p '$REMOTE_DIR'; cd '$REMOTE_DIR'; tar -czf backup-$(date -u +%Y%m%dT%H%M%SZ).tgz src scripts requirements.txt .env 2>/dev/null || true"
 LOG_JSON "backup" "finished" "Remote backup created"
 
 LOG_JSON "deploy" "started" "Syncing files to remote"
-rsync -az --delete --exclude '.git' --exclude '.venv' ./ "$DO_SSH_TARGET:$REMOTE_DIR/"
-ssh "$DO_SSH_TARGET" "set -e; cd '$REMOTE_DIR'; python3 -m venv .venv; . .venv/bin/activate; pip install -U pip; pip install -r requirements.txt; python -m playwright install chromium; sudo systemctl restart '$SERVICE_NAME'"
+RSYNC_SSH="ssh ${DO_SSH_OPTS}"
+rsync -az --delete \
+  -e "$RSYNC_SSH" \
+  --exclude '.git' \
+  --exclude '.venv' \
+  --exclude '.env' \
+  --exclude 'logs/' \
+  --exclude 'output/' \
+  ./ "$DO_SSH_TARGET:$REMOTE_DIR/"
+"${SSH_CMD[@]}" "$DO_SSH_TARGET" "set -e; cd '$REMOTE_DIR'; python3 -m venv .venv; . .venv/bin/activate; pip install -U pip; pip install -r requirements.txt; python -m playwright install chromium; sudo systemctl restart '$SERVICE_NAME'"
 LOG_JSON "deploy" "finished" "Remote deploy completed"
 
 LOG_JSON "postcheck" "started" "Running post-deploy checks"

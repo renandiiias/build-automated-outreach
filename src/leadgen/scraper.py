@@ -4,6 +4,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
+from urllib.parse import quote_plus
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
@@ -63,33 +64,23 @@ class GoogleMapsScraper:
                 page.keyboard.press("Enter")
                 self._random_pause(req)
             except PlaywrightTimeoutError:
-                runtime.timeout_events += 1
-                runtime.consecutive_errors += 1
-                runtime.consecutive_error_peak = max(runtime.consecutive_error_peak, runtime.consecutive_errors)
-                self._assert_not_paused(req, runtime)
-                return ScrapeResult(
-                    rows=[],
-                    paused=False,
-                    pause_reason="",
-                    captcha_events=runtime.captcha_events,
-                    timeout_events=runtime.timeout_events,
-                    http_429_events=runtime.http_429_events,
-                    consecutive_error_peak=runtime.consecutive_error_peak,
-                    unstable=True,
-                )
+                # Fallback robusto: abre direto a URL de busca, sem depender do input inicial.
+                page.goto(f"https://www.google.com/maps/search/{quote_plus(query)}?entry=ttu", timeout=90000)
+                self._random_pause(req)
 
+            self._wait_for_initial_results(page, timeout_ms=25000)
             self._load_more_results(page, req.max_results, req, runtime)
 
-            links = page.locator('a.hfpxzc')
-            total = min(links.count(), req.max_results)
+            links = self._result_links_locator(page)
+            hrefs = self._collect_place_links(links, req.max_results)
+            total = len(hrefs)
             rows: list[dict] = []
 
             for idx in range(total):
                 self._detect_risk_signals(page, runtime)
                 self._assert_not_paused(req, runtime)
                 try:
-                    link = links.nth(idx)
-                    link.click(timeout=20000)
+                    page.goto(hrefs[idx], timeout=25000)
                     self._random_pause(req)
                     rows.append(self._extract_place(page, query))
                     runtime.consecutive_errors = 0
@@ -131,6 +122,8 @@ class GoogleMapsScraper:
     def _fill_search_query(self, page: Page, query: str) -> None:
         selectors = [
             'input#searchboxinput',
+            'input[name="q"]',
+            'input#ucc-1',
             'input[aria-label*="Pesquisar"]',
             'input[aria-label*="Search Google Maps"]',
             'input[placeholder*="Pesquisar"]',
@@ -145,6 +138,41 @@ class GoogleMapsScraper:
             except Exception:
                 continue
         raise PlaywrightTimeoutError("searchbox_not_found")
+
+    def _result_links_locator(self, page: Page):
+        candidates = [
+            'a.hfpxzc',
+            'div[role="feed"] a[href*="/maps/place/"]',
+            '[role="article"] a[href*="/maps/place/"]',
+            'a[href*="/maps/place/"]',
+        ]
+        for selector in candidates:
+            loc = page.locator(selector)
+            try:
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                continue
+        return page.locator('a.hfpxzc')
+
+    def _collect_place_links(self, links, max_results: int) -> list[str]:
+        hrefs: list[str] = []
+        seen: set[str] = set()
+        for idx in range(links.count()):
+            if len(hrefs) >= max_results:
+                break
+            href = ""
+            try:
+                href = str(links.nth(idx).get_attribute("href") or "").strip()
+            except Exception:
+                continue
+            if "/maps/place/" not in href:
+                continue
+            if href in seen:
+                continue
+            seen.add(href)
+            hrefs.append(href)
+        return hrefs
 
     def _accept_possible_consent(self, page: Page) -> None:
         consent_labels = [
@@ -170,13 +198,25 @@ class GoogleMapsScraper:
 
         prev_count = 0
         stable_rounds = 0
+        zero_rounds = 0
+        start_ts = time.time()
         while True:
             self._detect_risk_signals(page, runtime)
             self._assert_not_paused(req, runtime)
+            if (time.time() - start_ts) > 120:
+                return
 
             cards = page.locator('a.hfpxzc').count()
             if cards >= max_results:
                 return
+            if cards <= 0:
+                zero_rounds += 1
+                if zero_rounds >= 6:
+                    return
+                self._random_pause(req)
+                continue
+
+            zero_rounds = 0
             if cards == prev_count:
                 stable_rounds += 1
             else:
@@ -189,9 +229,27 @@ class GoogleMapsScraper:
             panel.evaluate("el => el.scrollBy(0, 2400)")
             self._random_pause(req)
 
+    def _wait_for_initial_results(self, page: Page, timeout_ms: int = 25000) -> None:
+        deadline = time.time() + (timeout_ms / 1000.0)
+        while time.time() < deadline:
+            for selector in ('a.hfpxzc', 'div[role="feed"] a[href*="/maps/place/"]', '[role="article"]'):
+                try:
+                    if page.locator(selector).count() > 0:
+                        return
+                except Exception:
+                    continue
+            time.sleep(0.5)
+
     def _detect_risk_signals(self, page: Page, runtime: ScrapeRuntime) -> None:
-        content = page.content().lower()
-        if "captcha" in content or "unusual traffic" in content or "detected unusual traffic" in content:
+        try:
+            danger = (
+                page.locator("text=/captcha/i").count() > 0
+                or page.locator("text=/unusual traffic/i").count() > 0
+                or page.locator("text=/detected unusual traffic/i").count() > 0
+            )
+        except Exception:
+            return
+        if danger:
             runtime.captcha_events += 1
             runtime.consecutive_errors += 1
             runtime.consecutive_error_peak = max(runtime.consecutive_error_peak, runtime.consecutive_errors)

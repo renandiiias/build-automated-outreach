@@ -136,13 +136,18 @@ class CrmStore:
             raise RuntimeError("failed to upsert lead")
         return int(row_db[0])
 
+    def count_leads(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM leads").fetchone()
+        return int(row[0]) if row else 0
+
     def list_leads_for_initial_contact(self, limit: int = 100) -> list[Lead]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT id, run_id, business_name, maps_url, phone, email, website, address, stage, channel_preferred, opt_out
                 FROM leads
-                WHERE stage IN ('NEW', 'QUALIFIED') AND opt_out = 0 AND website = ''
+                WHERE stage IN ('NEW', 'QUALIFIED') AND opt_out = 0 AND channel_preferred IN ('EMAIL', 'WHATSAPP')
                 ORDER BY id ASC LIMIT ?
                 """,
                 (limit,),
