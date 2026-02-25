@@ -68,6 +68,9 @@ class LeadPipelineRunner:
         self.unsubscribe_base = os.getenv("UNSUBSCRIBE_BASE_URL", preview_base)
         self.wa_daily_limit = int(os.getenv("LEADGEN_WA_DAILY_LIMIT", "40"))
         self.allow_relaxed_icp = os.getenv("LEADGEN_ALLOW_RELAXED_ICP", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.email_only = os.getenv("LEADGEN_EMAIL_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if self.email_only:
+            self.wa_client = None
 
     def run_all(
         self,
@@ -243,6 +246,12 @@ class LeadPipelineRunner:
         for lead in leads:
             if count >= 250:
                 break
+            if self.email_only and lead.channel_preferred == "WHATSAPP":
+                self.logger.write(
+                    "lead_skipped",
+                    {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "email_only_mode"},
+                )
+                continue
             if lead.channel_preferred == "EMAIL" and lead.email:
                 if self.ops.is_channel_paused("EMAIL"):
                     continue
@@ -328,6 +337,12 @@ class LeadPipelineRunner:
         leads = self.store.list_leads_waiting_reply(limit=200)
         count = 0
         for lead in leads:
+            if self.email_only and lead.channel_preferred == "WHATSAPP":
+                self.logger.write(
+                    "followup_skipped",
+                    {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "email_only_mode"},
+                )
+                continue
             step = self.store.count_touches(lead.id, intent="CONSENT_REQUEST")
             # 1 inicial + 2 followups maximo.
             if step < 1 or step >= 3:
@@ -398,6 +413,12 @@ class LeadPipelineRunner:
         sent_count = 0
         wa_metrics = self.ops.get_channel_metrics("WHATSAPP")
         for lead in leads:
+            if self.email_only and lead.channel_preferred == "WHATSAPP":
+                self.logger.write(
+                    "offer_skipped",
+                    {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "email_only_mode"},
+                )
+                continue
             slug = f"{slugify(lead.business_name)}-{lead.id}"
             demo = self.demo_builder.build_for_lead(slug, lead.business_name, "prestador de servico", lead.address)
             self.store.set_preview_and_payment(lead.id, demo.preview_url, payment_url)
