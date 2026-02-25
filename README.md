@@ -1,6 +1,6 @@
 # LeadGenerator (Google Maps -> Consentimento -> Demo -> Oferta)
 
-Servico de leadgen com foco em negocios no Google Maps sem website, com protecao anti-ban, outreach por email (Resend) e fallback WhatsApp (WPPConnect).
+Servico de leadgen com foco em negocios no Google Maps sem website, com protecao anti-ban e outreach por email (Resend), com cadencia de 7 dias, precificacao adaptativa e revisao de respostas via fila Codex.
 
 ## O que foi implementado
 
@@ -26,6 +26,16 @@ Servico de leadgen com foco em negocios no Google Maps sem website, com protecao
   - fallback local sem IA quando necessario
 - Envio de oferta apos aceite:
   - preview + pagamento
+- Escada de preco adaptativa:
+  - inicio em R$200 (completo) / R$100 (simples)
+  - sobe +100 por venda
+  - desce 1 nivel quando janela de 10 ofertas nao sustenta conversao
+- Fila obrigatoria de revisao inbound:
+  - 100% dos inbounds entram em `reply_review_queue`
+  - sem resposta comercial sem decisao Codex
+- Operacao de dominio por venda:
+  - cria `domain_jobs` com checklist
+  - alerta de expiracao em 30/15/7 dias
 - Kill-switch automatico:
   - `EMAIL_PAUSED`, `WHATSAPP_PAUSED`, `SCRAPE_PAUSED`
   - `GLOBAL_SAFE_MODE` quando >= 2 canais pausados
@@ -76,6 +86,8 @@ python scripts/run_pipeline.py followups --run-id manual
 python scripts/run_pipeline.py reply --lead-id 42 --channel WHATSAPP --text "sim pode enviar"
 python scripts/run_pipeline.py offers --run-id manual --payment-url "https://pay.example/checkout/abc"
 python scripts/run_pipeline.py email-feedback --sent 120 --bounces 8 --complaints 1
+python scripts/run_pipeline.py sales-mark --lead-id 42 --accepted-plan COMPLETO --run-id manual
+python scripts/run_pipeline.py close-stale --run-id manual
 ```
 
 ## Politica anti-ban aplicada

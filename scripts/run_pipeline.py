@@ -49,6 +49,15 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("--complaints", type=int, default=0)
     feedback.add_argument("--sent", type=int, default=0)
 
+    sales = sub.add_parser("sales-mark", help="Marca venda manual e sobe nivel de preco")
+    sales.add_argument("--lead-id", type=int, required=True)
+    sales.add_argument("--run-id", default="manual")
+    sales.add_argument("--accepted-plan", choices=["COMPLETO", "SIMPLES"], default="COMPLETO")
+    sales.add_argument("--reason", default="manual_sale_mark")
+
+    close = sub.add_parser("close-stale", help="Fecha sequencias estagnadas em LOST pelo prazo configurado")
+    close.add_argument("--run-id", default="manual")
+
     return parser
 
 
@@ -118,6 +127,25 @@ def main() -> int:
     if args.command == "email-feedback":
         runner.register_email_feedback(bounces=args.bounces, complaints=args.complaints, sent=args.sent)
         print("email_feedback_recorded=1")
+        return 0
+
+    if args.command == "sales-mark":
+        info = runner.mark_sale(
+            run_id=args.run_id,
+            lead_id=args.lead_id,
+            accepted_plan=args.accepted_plan,
+            reason=args.reason,
+        )
+        print(
+            f"sale_marked=1 lead_id={args.lead_id} accepted_plan={info['accepted_plan']} "
+            f"sale_amount={info['sale_amount']} new_level={info['new_level']} "
+            f"price_full={info['price_full']} price_simple={info['price_simple']}"
+        )
+        return 0
+
+    if args.command == "close-stale":
+        n = runner.close_stale_sequences(run_id=args.run_id)
+        print(f"closed_lost={n}")
         return 0
 
     return 1

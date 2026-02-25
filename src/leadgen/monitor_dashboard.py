@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -11,7 +11,7 @@ from typing import Any
 from .config import get_config
 
 
-def _read_last_events(path: Path, max_lines: int = 120) -> list[dict[str, Any]]:
+def _read_last_events(path: Path, max_lines: int = 200) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-max_lines:]
@@ -80,6 +80,192 @@ def _ops_snapshot(ops_db: Path) -> dict[str, Any]:
     }
 
 
+def _pricing_snapshot(db_path: Path) -> dict[str, Any]:
+    defaults = {
+        "price_level": 0,
+        "price_full": 200,
+        "price_simple": 100,
+        "baseline_conversion": None,
+        "offers_in_window": 0,
+        "sales_in_window": 0,
+        "updated_at_utc": "",
+    }
+    if not db_path.exists():
+        return defaults
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT price_level, price_full, price_simple, baseline_conversion, offers_in_window, sales_in_window, updated_at_utc
+                FROM pricing_state WHERE id=1
+                """
+            ).fetchone()
+    except sqlite3.Error:
+        return defaults
+    if not row:
+        return defaults
+    baseline = float(row[3]) if row[3] is not None else None
+    return {
+        "price_level": int(row[0]),
+        "price_full": int(row[1]),
+        "price_simple": int(row[2]),
+        "baseline_conversion": baseline,
+        "offers_in_window": int(row[4]),
+        "sales_in_window": int(row[5]),
+        "updated_at_utc": str(row[6] or ""),
+    }
+
+
+def _funnel_7d(db_path: Path) -> dict[str, Any]:
+    defaults = {
+        "leads_7d": 0,
+        "consented_7d": 0,
+        "offers_7d": 0,
+        "won_7d": 0,
+        "lost_7d": 0,
+        "conversion_7d": 0.0,
+        "avg_days_to_win_7d": 0.0,
+        "revenue_estimated_7d": 0.0,
+    }
+    if not db_path.exists():
+        return defaults
+    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            leads_7d = int(conn.execute("SELECT COUNT(*) FROM leads WHERE created_at_utc >= ?", (since,)).fetchone()[0])
+            consented_7d = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM leads WHERE consent_accepted=1 AND updated_at_utc >= ?",
+                    (since,),
+                ).fetchone()[0]
+            )
+            offers_7d = int(conn.execute("SELECT COUNT(*) FROM offer_snapshots WHERE offered_at_utc >= ?", (since,)).fetchone()[0])
+            won_7d = int(conn.execute("SELECT COUNT(*) FROM leads WHERE stage='WON' AND updated_at_utc >= ?", (since,)).fetchone()[0])
+            lost_7d = int(conn.execute("SELECT COUNT(*) FROM leads WHERE stage='LOST' AND updated_at_utc >= ?", (since,)).fetchone()[0])
+            avg_days_row = conn.execute(
+                """
+                SELECT AVG(julianday(won_at_utc) - julianday(created_at_utc))
+                FROM leads
+                WHERE stage='WON' AND won_at_utc != '' AND won_at_utc >= ?
+                """,
+                (since,),
+            ).fetchone()
+            revenue_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(sale_amount), 0)
+                FROM leads
+                WHERE stage='WON' AND won_at_utc != '' AND won_at_utc >= ?
+                """,
+                (since,),
+            ).fetchone()
+    except sqlite3.Error:
+        return defaults
+    conversion = (won_7d / offers_7d) if offers_7d else 0.0
+    return {
+        "leads_7d": leads_7d,
+        "consented_7d": consented_7d,
+        "offers_7d": offers_7d,
+        "won_7d": won_7d,
+        "lost_7d": lost_7d,
+        "conversion_7d": conversion,
+        "avg_days_to_win_7d": float(avg_days_row[0] or 0.0),
+        "revenue_estimated_7d": float(revenue_row[0] or 0.0),
+    }
+
+
+def _domain_ops_snapshot(db_path: Path) -> dict[str, Any]:
+    if not db_path.exists():
+        return {"total_jobs": 0, "in_progress": 0, "by_status": [], "next_expiring": []}
+    now = datetime.now(timezone.utc)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            total_jobs = int(conn.execute("SELECT COUNT(*) FROM domain_jobs").fetchone()[0])
+            by_status_rows = conn.execute(
+                "SELECT status, COUNT(*) FROM domain_jobs GROUP BY status ORDER BY COUNT(*) DESC"
+            ).fetchall()
+            expiring_rows = conn.execute(
+                """
+                SELECT id, lead_id, domain_name, status, expires_at_utc
+                FROM domain_jobs
+                WHERE expires_at_utc != ''
+                ORDER BY expires_at_utc ASC
+                LIMIT 10
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return {"total_jobs": 0, "in_progress": 0, "by_status": [], "next_expiring": []}
+    by_status = [{"status": str(r[0]), "count": int(r[1])} for r in by_status_rows]
+    in_progress_status = {"DOMAIN_SELECTED", "DOMAIN_PURCHASED", "DNS_POINTED", "SSL_OK"}
+    in_progress = sum(item["count"] for item in by_status if item["status"] in in_progress_status)
+    next_expiring: list[dict[str, Any]] = []
+    for r in expiring_rows:
+        expires_raw = str(r[4] or "")
+        try:
+            expires_at = datetime.fromisoformat(expires_raw)
+            days_left = (expires_at.date() - now.date()).days
+        except Exception:
+            days_left = None
+        next_expiring.append(
+            {
+                "id": int(r[0]),
+                "lead_id": int(r[1]),
+                "domain_name": str(r[2] or ""),
+                "status": str(r[3] or ""),
+                "expires_at_utc": expires_raw,
+                "days_left": days_left,
+            }
+        )
+    return {
+        "total_jobs": total_jobs,
+        "in_progress": in_progress,
+        "by_status": by_status,
+        "next_expiring": next_expiring,
+    }
+
+
+def _reply_queue_snapshot(db_path: Path) -> dict[str, Any]:
+    if not db_path.exists():
+        return {"counts": {"pending": 0, "codex_done": 0, "review_required": 0, "sent": 0}, "top_pending": []}
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*)
+                FROM reply_review_queue
+                GROUP BY status
+                """
+            ).fetchall()
+            pending = conn.execute(
+                """
+                SELECT id, lead_id, inbound_text, created_at_utc
+                FROM reply_review_queue
+                WHERE status IN ('PENDING', 'REVIEW_REQUIRED')
+                ORDER BY id ASC
+                LIMIT 8
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return {"counts": {"pending": 0, "codex_done": 0, "review_required": 0, "sent": 0}, "top_pending": []}
+    counts = {str(r[0]): int(r[1]) for r in rows}
+    return {
+        "counts": {
+            "pending": counts.get("PENDING", 0),
+            "codex_done": counts.get("CODEX_DONE", 0),
+            "review_required": counts.get("REVIEW_REQUIRED", 0),
+            "sent": counts.get("SENT", 0),
+        },
+        "top_pending": [
+            {
+                "id": int(r[0]),
+                "lead_id": int(r[1]),
+                "inbound_text": str(r[2] or "")[:220],
+                "created_at_utc": str(r[3] or ""),
+            }
+            for r in pending
+        ],
+    }
+
+
 def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     counter = Counter()
     for e in events:
@@ -88,11 +274,13 @@ def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "contact_delivered": counter.get("contact_delivered", 0),
         "contact_failed": counter.get("contact_failed", 0),
         "lead_qualified": counter.get("lead_qualified", 0),
-        "demo_published": counter.get("demo_published", 0),
         "offer_sent": counter.get("offer_sent", 0),
-        "opt_out_registered": counter.get("opt_out_registered", 0),
-        "safe_mode_enabled": counter.get("safe_mode_enabled", 0),
-        "channel_paused": counter.get("channel_paused", 0),
+        "sale_marked": counter.get("sale_marked", 0),
+        "pricing_level_up": counter.get("pricing_level_up", 0),
+        "pricing_level_down": counter.get("pricing_level_down", 0),
+        "reply_queued_for_codex": counter.get("reply_queued_for_codex", 0),
+        "reply_sent": counter.get("reply_sent", 0),
+        "domain_job_created": counter.get("domain_job_created", 0),
     }
 
 
@@ -103,8 +291,12 @@ def build_snapshot() -> dict[str, Any]:
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "db": _db_counts(cfg.state_db),
         "ops": _ops_snapshot(cfg.ops_state_db),
+        "pricing": _pricing_snapshot(cfg.state_db),
+        "funnel_7d": _funnel_7d(cfg.state_db),
+        "domain_ops": _domain_ops_snapshot(cfg.state_db),
+        "reply_queue": _reply_queue_snapshot(cfg.state_db),
         "events_summary": _compute_event_summary(events),
-        "events": events[-40:],
+        "events": events[-50:],
     }
 
 
@@ -125,7 +317,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return
 
     def _json(self, code: int, payload: dict[str, Any]) -> None:
-        raw = json.dumps(payload).encode("utf-8")
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
@@ -146,28 +338,50 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def render_dashboard_html() -> str:
     snap = build_snapshot()
-    stage_items = "".join(
-        f"<li><b>{k}</b>: {v}</li>" for k, v in sorted(snap["db"]["stage_counts"].items())
-    ) or "<li>Sem leads ainda</li>"
-    channel_items = "".join(
-        f"<li><b>{c['channel']}</b> - {c['status']} {('(' + c['reason'] + ')') if c['reason'] else ''}</li>"
-        for c in snap["ops"]["channels"]
-    ) or "<li>Sem status de canal ainda</li>"
-    metric_rows = "".join(
-        f"<tr><td>{m['channel']}</td><td>{m['sent']}</td><td>{m['failed']}</td><td>{m['bounces']}</td><td>{m['complaints']}</td></tr>"
-        for m in snap["ops"]["metrics"]
-    ) or "<tr><td colspan='5'>Sem metricas hoje</td></tr>"
+    pricing = snap["pricing"]
+    funnel = snap["funnel_7d"]
+    queue = snap["reply_queue"]
+    domains = snap["domain_ops"]
+    ops = snap["ops"]
+    es = snap["events_summary"]
+    progress_pct = min(100, int((pricing["offers_in_window"] / 10) * 100))
+    safe_mode = "ATIVO" if ops["global_safe_mode"] else "DESATIVADO"
+    safe_class = "bad" if ops["global_safe_mode"] else "ok"
+    baseline_txt = f"{pricing['baseline_conversion'] * 100:.1f}%" if pricing["baseline_conversion"] is not None else "n/a"
+    conv_txt = f"{funnel['conversion_7d'] * 100:.1f}%"
+
+    stage_funnel = [
+        ("Leads 7d", funnel["leads_7d"]),
+        ("Consentidos 7d", funnel["consented_7d"]),
+        ("Ofertas 7d", funnel["offers_7d"]),
+        ("Vendas 7d", funnel["won_7d"]),
+        ("Perdidos 7d", funnel["lost_7d"]),
+    ]
+    funnel_rows = "".join(
+        f"<div class='funnel-item'><span>{label}</span><b>{value}</b></div>" for label, value in stage_funnel
+    )
+    pending_rows = "".join(
+        f"<tr><td>#{it['id']}</td><td>Lead {it['lead_id']}</td><td>{it['created_at_utc']}</td><td><code>{it['inbound_text']}</code></td></tr>"
+        for it in queue["top_pending"]
+    ) or "<tr><td colspan='4'>Sem pendencias.</td></tr>"
+
+    domain_rows = "".join(
+        f"<tr><td>{d['id']}</td><td>{d['domain_name'] or '-'}</td><td>{d['status']}</td><td>{d['days_left'] if d['days_left'] is not None else '-'}</td></tr>"
+        for d in domains["next_expiring"][:8]
+    ) or "<tr><td colspan='4'>Sem dominios com expiracao registrada.</td></tr>"
+
+    channel_rows = "".join(
+        f"<tr><td>{c['channel']}</td><td>{c['status']}</td><td>{c['reason'] or '-'}</td></tr>" for c in ops["channels"]
+    ) or "<tr><td colspan='3'>Sem canais registrados.</td></tr>"
 
     event_rows = ""
-    for e in reversed(snap["events"][-20:]):
+    for e in reversed(snap["events"][-18:]):
         ts = str(e.get("timestamp_utc", ""))
         ev = str(e.get("event_type", ""))
         payload = json.dumps(e.get("payload", {}), ensure_ascii=False)
         event_rows += f"<tr><td>{ts}</td><td>{ev}</td><td><code>{payload}</code></td></tr>"
-
-    safe_mode = "ATIVO" if snap["ops"]["global_safe_mode"] else "DESATIVADO"
-    safe_color = "#b91c1c" if snap["ops"]["global_safe_mode"] else "#166534"
-    es = snap["events_summary"]
+    if not event_rows:
+        event_rows = "<tr><td colspan='3'>Sem eventos ainda.</td></tr>"
 
     return f"""<!doctype html>
 <html lang='pt-BR'>
@@ -175,60 +389,168 @@ def render_dashboard_html() -> str:
   <meta charset='utf-8'/>
   <meta name='viewport' content='width=device-width, initial-scale=1'/>
   <meta http-equiv='refresh' content='10'/>
-  <title>LeadGenerator Dashboard</title>
+  <title>LeadGenerator - Painel Comercial</title>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 0; background: #f3f4f6; color: #111827; }}
-    .wrap {{ max-width: 1200px; margin: 18px auto; padding: 0 16px 24px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit,minmax(240px,1fr)); gap: 12px; }}
-    .card {{ background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; }}
-    h1 {{ margin: 0 0 6px; }}
-    h2 {{ margin: 0 0 8px; font-size: 16px; }}
-    .kpi {{ font-size: 28px; font-weight: 700; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-    th, td {{ border-bottom: 1px solid #e5e7eb; text-align: left; padding: 6px; vertical-align: top; }}
-    code {{ white-space: pre-wrap; word-break: break-word; }}
+    :root {{
+      --bg0:#f2f6f9;
+      --bg1:#e8f2ff;
+      --card:#ffffff;
+      --ink:#0f172a;
+      --muted:#475569;
+      --line:#dbe3ee;
+      --ok:#15803d;
+      --warn:#c2410c;
+      --bad:#b91c1c;
+      --brand:#0f766e;
+      --brand2:#1d4ed8;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(1200px 500px at 90% -10%, #cbe7ff 0%, transparent 65%), linear-gradient(180deg, var(--bg1), var(--bg0));
+    }}
+    .wrap {{ max-width: 1220px; margin: 0 auto; padding: 16px 16px 28px; }}
+    .hero {{
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, #f8fbff 0%, #edf7ff 45%, #eefaf4 100%);
+      border-radius: 14px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+    }}
+    .hero h1 {{ margin: 0; font-size: 22px; letter-spacing: 0.2px; }}
+    .hero p {{ margin: 4px 0 0; color: var(--muted); font-size: 13px; }}
+    .grid {{ display: grid; gap: 10px; }}
+    .kpis {{ grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }}
+    .split {{ grid-template-columns: 1.6fr 1fr; }}
+    .triple {{ grid-template-columns: 1fr 1fr 1fr; }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }}
+    .kpi-title {{ font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.6px; }}
+    .kpi-value {{ font-size: 28px; font-weight: 700; margin-top: 2px; }}
+    .ok {{ color: var(--ok); }} .bad {{ color: var(--bad); }} .warn {{ color: var(--warn); }}
+    .price-row {{ display:flex; gap:10px; margin-top:6px; }}
+    .pill {{
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 4px 10px;
+      font-size: 12px;
+      color: var(--muted);
+      background: #f8fafc;
+    }}
+    .progress {{
+      width: 100%; height: 10px; border-radius: 999px; background: #e2e8f0; overflow: hidden; margin-top: 8px;
+    }}
+    .progress > i {{
+      display:block; height: 100%; width: {progress_pct}%;
+      background: linear-gradient(90deg, var(--brand), var(--brand2));
+    }}
+    h2 {{ margin: 0 0 8px; font-size: 15px; }}
+    .funnel {{ display:grid; gap:7px; }}
+    .funnel-item {{
+      display:flex; justify-content:space-between; align-items:center;
+      border:1px solid var(--line); border-radius:9px; padding:8px 10px;
+      background: #fbfdff;
+    }}
+    table {{ width:100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{ border-bottom:1px solid var(--line); text-align:left; padding:6px; vertical-align:top; }}
+    code {{ white-space: pre-wrap; word-break: break-word; color:#0f172a; font-family: "SFMono-Regular", Menlo, monospace; }}
+    .muted {{ color: var(--muted); font-size: 12px; }}
+    @media (max-width: 940px) {{
+      .split, .triple {{ grid-template-columns: 1fr; }}
+    }}
   </style>
 </head>
 <body>
 <div class='wrap'>
-  <h1>LeadGenerator - Status ao vivo</h1>
-  <p>Atualizado em {snap['generated_at_utc']}</p>
+  <section class='hero'>
+    <h1>Painel Comercial LeadGenerator</h1>
+    <p>Atualizado em {snap['generated_at_utc']} (UTC). Status: <b class='{safe_class}'>{safe_mode}</b>.</p>
+  </section>
 
-  <div class='grid'>
-    <div class='card'><h2>Safe Mode</h2><div class='kpi' style='color:{safe_color}'>{safe_mode}</div></div>
-    <div class='card'><h2>Leads no banco</h2><div class='kpi'>{snap['db']['leads_total']}</div></div>
-    <div class='card'><h2>Contatos enviados</h2><div class='kpi'>{es['contact_delivered']}</div></div>
-    <div class='card'><h2>Falhas de contato</h2><div class='kpi'>{es['contact_failed']}</div></div>
-    <div class='card'><h2>Demos publicadas</h2><div class='kpi'>{es['demo_published']}</div></div>
-    <div class='card'><h2>Ofertas enviadas</h2><div class='kpi'>{es['offer_sent']}</div></div>
-  </div>
-
-  <div class='grid' style='margin-top:12px'>
+  <section class='grid kpis'>
     <div class='card'>
-      <h2>Estagios dos leads</h2>
-      <ul>{stage_items}</ul>
+      <div class='kpi-title'>Preco Atual</div>
+      <div class='kpi-value'>R$ {pricing['price_full']} / R$ {pricing['price_simple']}</div>
+      <div class='price-row'>
+        <span class='pill'>Nivel {pricing['price_level']}</span>
+        <span class='pill'>Baseline {baseline_txt}</span>
+      </div>
     </div>
     <div class='card'>
-      <h2>Status dos canais</h2>
-      <ul>{channel_items}</ul>
+      <div class='kpi-title'>Conversao 7d</div>
+      <div class='kpi-value'>{conv_txt}</div>
+      <div class='muted'>Vendas: {funnel['won_7d']} | Ofertas: {funnel['offers_7d']}</div>
     </div>
-  </div>
+    <div class='card'>
+      <div class='kpi-title'>Ofertas no Bloco</div>
+      <div class='kpi-value'>{pricing['offers_in_window']}/10</div>
+      <div class='progress'><i></i></div>
+    </div>
+    <div class='card'>
+      <div class='kpi-title'>Vendas 7d</div>
+      <div class='kpi-value'>{funnel['won_7d']}</div>
+      <div class='muted'>Tempo medio ate venda: {funnel['avg_days_to_win_7d']:.1f} dias</div>
+    </div>
+    <div class='card'>
+      <div class='kpi-title'>Receita Estimada 7d</div>
+      <div class='kpi-value'>R$ {funnel['revenue_estimated_7d']:.0f}</div>
+      <div class='muted'>Apenas vendas marcadas como WON</div>
+    </div>
+    <div class='card'>
+      <div class='kpi-title'>Fila Codex</div>
+      <div class='kpi-value'>{queue['counts']['pending'] + queue['counts']['review_required']}</div>
+      <div class='muted'>PENDENTE + REVISAO</div>
+    </div>
+  </section>
 
-  <div class='card' style='margin-top:12px'>
-    <h2>Metricas de canal (hoje)</h2>
-    <table>
-      <thead><tr><th>Canal</th><th>Enviados</th><th>Falhas</th><th>Bounces</th><th>Complaints</th></tr></thead>
-      <tbody>{metric_rows}</tbody>
-    </table>
-  </div>
+  <section class='grid split' style='margin-top:10px'>
+    <div class='card'>
+      <h2>Funil Comercial (7 dias)</h2>
+      <div class='funnel'>{funnel_rows}</div>
+    </div>
+    <div class='card'>
+      <h2>Canal e Saude Operacional</h2>
+      <table>
+        <thead><tr><th>Canal</th><th>Status</th><th>Motivo</th></tr></thead>
+        <tbody>{channel_rows}</tbody>
+      </table>
+      <div class='muted' style='margin-top:8px'>
+        Entregues: {es['contact_delivered']} | Falhas: {es['contact_failed']} | Ofertas enviadas: {es['offer_sent']}
+      </div>
+    </div>
+  </section>
 
-  <div class='card' style='margin-top:12px'>
-    <h2>Eventos recentes</h2>
-    <table>
-      <thead><tr><th>Timestamp UTC</th><th>Evento</th><th>Payload</th></tr></thead>
-      <tbody>{event_rows or "<tr><td colspan='3'>Sem eventos ainda</td></tr>"}</tbody>
-    </table>
-  </div>
+  <section class='grid triple' style='margin-top:10px'>
+    <div class='card'>
+      <h2>Revisao Codex Pendente</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Lead</th><th>Recebido</th><th>Mensagem</th></tr></thead>
+        <tbody>{pending_rows}</tbody>
+      </table>
+    </div>
+    <div class='card'>
+      <h2>Dominios em Implantacao</h2>
+      <div class='muted'>Total jobs: {domains['total_jobs']} | Em andamento: {domains['in_progress']}</div>
+      <table>
+        <thead><tr><th>Job</th><th>Dominio</th><th>Status</th><th>Dias</th></tr></thead>
+        <tbody>{domain_rows}</tbody>
+      </table>
+    </div>
+    <div class='card'>
+      <h2>Timeline Recente</h2>
+      <table>
+        <thead><tr><th>UTC</th><th>Evento</th><th>Payload</th></tr></thead>
+        <tbody>{event_rows}</tbody>
+      </table>
+    </div>
+  </section>
 </div>
 </body>
 </html>"""

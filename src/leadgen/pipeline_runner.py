@@ -20,6 +20,7 @@ from .incident import IncidentEngine
 from .logging_utils import JsonlLogger
 from .ops_state import OperationalState
 from .outreach import (
+    detect_plan_choice,
     classify_reply,
     get_resend_client_from_env,
     get_wpp_client_from_env,
@@ -28,6 +29,7 @@ from .outreach import (
     is_opt_out_reply,
     normalize_phone_br,
     offer_email,
+    offer_followup_email,
     offer_whatsapp,
     followup_consent_email,
     followup_consent_whatsapp,
@@ -69,6 +71,8 @@ class LeadPipelineRunner:
         self.wa_daily_limit = int(os.getenv("LEADGEN_WA_DAILY_LIMIT", "40"))
         self.allow_relaxed_icp = os.getenv("LEADGEN_ALLOW_RELAXED_ICP", "1").strip().lower() in {"1", "true", "yes", "on"}
         self.email_only = os.getenv("LEADGEN_EMAIL_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self.close_days = int(os.getenv("LEADGEN_CLOSE_DAYS", "7"))
+        self.reply_confidence_min = float(os.getenv("LEADGEN_REPLY_CONFIDENCE_MIN", "0.65"))
         if self.email_only:
             self.wa_client = None
 
@@ -88,6 +92,8 @@ class LeadPipelineRunner:
         consent_sent = self.send_initial_outreach(run_id)
         followups_sent = self.send_followups(run_id)
         offers_sent = self.send_offers_for_consented(run_id, payment_url=payment_url)
+        closed_lost = self.close_stale_sequences(run_id)
+        self._emit_domain_expiry_alerts(run_id)
 
         self.logger.write(
             "pipeline_run_finished",
@@ -97,6 +103,7 @@ class LeadPipelineRunner:
                 "consent_sent": consent_sent,
                 "followups_sent": followups_sent,
                 "offers_sent": offers_sent,
+                "closed_lost": closed_lost,
             },
         )
         return PipelineSummary(
@@ -275,7 +282,12 @@ class LeadPipelineRunner:
 
                 variant = (lead.id % 3) + 1
                 unsub = build_unsubscribe_url(self.unsubscribe_base, lead.id, "EMAIL")
-                subject, body_text, html = initial_consent_email(lead.business_name, unsub, variant=variant)
+                subject, body_text, html = initial_consent_email(
+                    lead.business_name,
+                    unsub,
+                    variant=variant,
+                    city=lead.address,
+                )
                 sent = self.email_client.send(lead.email, subject, html)
                 self.store.save_touch(lead.id, "EMAIL", "CONSENT_REQUEST", f"email_v{variant}", sent.status, sent.message_id, body_text)
                 self.ops.add_channel_metrics("EMAIL", sent=1, failed=0 if sent.ok else 1)
@@ -334,8 +346,10 @@ class LeadPipelineRunner:
     def send_followups(self, run_id: str) -> int:
         if self.ops.global_safe_mode_enabled():
             return 0
-        leads = self.store.list_leads_waiting_reply(limit=200)
         count = 0
+
+        # Consent follow-ups: D+2 and D+4.
+        leads = self.store.list_leads_waiting_reply(limit=300)
         for lead in leads:
             if self.email_only and lead.channel_preferred == "WHATSAPP":
                 self.logger.write(
@@ -343,8 +357,14 @@ class LeadPipelineRunner:
                     {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "email_only_mode"},
                 )
                 continue
+
             step = self.store.count_touches(lead.id, intent="CONSENT_REQUEST")
-            # 1 inicial + 2 followups maximo.
+            first_touch = self.store.get_first_touch_timestamp(lead.id, intent="CONSENT_REQUEST")
+            if not first_touch:
+                continue
+            days_since = max(0, (datetime.now(UTC) - datetime.fromisoformat(first_touch)).days)
+            if (step == 1 and days_since < 2) or (step == 2 and days_since < 4):
+                continue
             if step < 1 or step >= 3:
                 continue
 
@@ -369,8 +389,36 @@ class LeadPipelineRunner:
                 count += 1
                 random_human_delay()
 
-        if count:
-            self.logger.write("followup_batch_sent", {"run_id": run_id, "count": count})
+        # Offer follow-ups: D+1 and D+3.
+        offered = self.store.list_leads_by_stage("PAYMENT_SENT", limit=300)
+        for lead in offered:
+            if lead.channel_preferred != "EMAIL" or not lead.email or not self.email_client:
+                continue
+            if self.ops.is_channel_paused("EMAIL"):
+                continue
+            offer_step = self.store.count_touches(lead.id, intent="OFFER")
+            first_offer = self.store.get_first_touch_timestamp(lead.id, intent="OFFER")
+            if not first_offer:
+                continue
+            days_since_offer = max(0, (datetime.now(UTC) - datetime.fromisoformat(first_offer)).days)
+            next_step = 0
+            if offer_step == 1 and days_since_offer >= 1:
+                next_step = 1
+            elif offer_step == 2 and days_since_offer >= 3:
+                next_step = 2
+            if next_step == 0:
+                continue
+            unsub = build_unsubscribe_url(self.unsubscribe_base, lead.id, "EMAIL")
+            subject, body_text, html = offer_followup_email(lead.business_name, unsub, step=next_step)
+            sent = self.email_client.send(lead.email, subject, html)
+            self.store.save_touch(lead.id, "EMAIL", "OFFER", f"email_offer_followup_{next_step}", sent.status, sent.message_id, body_text)
+            self.ops.add_channel_metrics("EMAIL", sent=1, failed=0 if sent.ok else 1)
+            count += 1
+            random_human_delay()
+
+        closed_lost = self.close_stale_sequences(run_id)
+        if count or closed_lost:
+            self.logger.write("followup_batch_sent", {"run_id": run_id, "count": count, "closed_lost": closed_lost})
         self._evaluate_email_health(run_id)
         self._evaluate_whatsapp_health(run_id)
         self._evaluate_global_safe_mode(run_id)
@@ -398,8 +446,23 @@ class LeadPipelineRunner:
             self.logger.write("opt_out_registered", {"run_id": run_id, "lead_id": lead_id, "channel": channel})
             return
         if classification == "positive":
-            self.store.set_consent(lead_id, accepted=True)
-            self.logger.write("consent_received", {"run_id": run_id, "lead_id": lead_id, "channel": channel})
+            if self.store.has_offer_sent(lead_id):
+                plan = detect_plan_choice(text)
+                info = self.mark_sale(run_id=run_id, lead_id=lead_id, accepted_plan=plan, reason="positive_after_offer")
+                self.logger.write(
+                    "sale_marked",
+                    {
+                        "run_id": run_id,
+                        "lead_id": lead_id,
+                        "channel": channel,
+                        "accepted_plan": info["accepted_plan"],
+                        "sale_amount": info["sale_amount"],
+                        "price_level": info["new_level"],
+                    },
+                )
+            else:
+                self.store.set_consent(lead_id, accepted=True)
+                self.logger.write("consent_received", {"run_id": run_id, "lead_id": lead_id, "channel": channel})
             return
         self.store.update_stage(lead_id, "WAITING_REPLY")
         self.logger.write("objection_handled", {"run_id": run_id, "lead_id": lead_id, "classification": classification})
@@ -425,14 +488,47 @@ class LeadPipelineRunner:
             self.logger.write("demo_published", {"run_id": run_id, "lead_id": lead.id, "preview_url": demo.preview_url, "file_path": str(demo.file_path)})
 
             if lead.channel_preferred == "EMAIL" and lead.email and self.email_client and not self.ops.is_channel_paused("EMAIL"):
+                pricing = self.store.get_pricing_state()
                 unsub = build_unsubscribe_url(self.unsubscribe_base, lead.id, "EMAIL")
-                subject, body_text, html = offer_email(lead.business_name, demo.preview_url, payment_url, unsub)
+                subject, body_text, html = offer_email(
+                    lead.business_name,
+                    demo.preview_url,
+                    payment_url,
+                    unsub,
+                    price_full=pricing.price_full,
+                    price_simple=pricing.price_simple,
+                )
                 result = self.email_client.send(lead.email, subject, html)
                 self.store.save_touch(lead.id, "EMAIL", "OFFER", "email_offer_v1", result.status, result.message_id, body_text)
                 self.ops.add_channel_metrics("EMAIL", sent=1, failed=0 if result.ok else 1)
                 if result.ok:
+                    pricing_eval = self.store.record_offer_snapshot(lead.id, run_id=run_id)
                     self.store.update_stage(lead.id, "PAYMENT_SENT")
-                    self.logger.write("offer_sent", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "preview_url": demo.preview_url})
+                    self.logger.write(
+                        "offer_sent",
+                        {
+                            "run_id": run_id,
+                            "lead_id": lead.id,
+                            "channel": "EMAIL",
+                            "preview_url": demo.preview_url,
+                            "price_level": pricing.price_level,
+                            "price_full": pricing.price_full,
+                            "price_simple": pricing.price_simple,
+                            "offers_in_window": pricing_eval.get("offers_in_window", 0),
+                            "sales_in_window": pricing_eval.get("sales_in_window", 0),
+                        },
+                    )
+                    if pricing_eval.get("window_closed"):
+                        self.logger.write(
+                            "pricing_window_closed",
+                            {
+                                "run_id": run_id,
+                                "price_level": pricing.price_level,
+                                "window_conversion": pricing_eval.get("window_conversion", 0),
+                            },
+                        )
+                    for evt in pricing_eval.get("events", []):
+                        self.logger.write(evt["event"], {"run_id": run_id, **{k: v for k, v in evt.items() if k != "event"}})
                     sent_count += 1
                 else:
                     self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "detail": result.detail})
@@ -468,6 +564,58 @@ class LeadPipelineRunner:
         self._evaluate_whatsapp_health(run_id)
         self._evaluate_global_safe_mode(run_id)
         return sent_count
+
+    def mark_sale(self, run_id: str, lead_id: int, accepted_plan: str, reason: str) -> dict:
+        info = self.store.mark_sale(
+            lead_id=lead_id,
+            run_id=run_id,
+            reason=reason,
+            accepted_plan=accepted_plan,
+        )
+        self.logger.write(
+            "pricing_level_up",
+            {
+                "run_id": run_id,
+                "lead_id": lead_id,
+                "from_level": info["old_level"],
+                "to_level": info["new_level"],
+                "accepted_plan": info["accepted_plan"],
+                "sale_amount": info["sale_amount"],
+            },
+        )
+        self.logger.write(
+            "domain_job_created",
+            {
+                "run_id": run_id,
+                "lead_id": lead_id,
+                "status": "DOMAIN_SELECTED",
+            },
+        )
+        return info
+
+    def close_stale_sequences(self, run_id: str) -> int:
+        lost_ids = self.store.close_expired_sequences(max_days=self.close_days)
+        for lead_id in lost_ids:
+            self.logger.write(
+                "lead_closed_lost",
+                {"run_id": run_id, "lead_id": lead_id, "reason": f"no_close_within_{self.close_days}d"},
+            )
+        return len(lost_ids)
+
+    def _emit_domain_expiry_alerts(self, run_id: str) -> None:
+        alerts = self.store.list_domain_alert_candidates([30, 15, 7])
+        for alert in alerts:
+            self.logger.write(
+                "domain_expiry_alert",
+                {
+                    "run_id": run_id,
+                    "domain_job_id": alert["job_id"],
+                    "lead_id": alert["lead_id"],
+                    "domain_name": alert["domain_name"],
+                    "days_left": alert["days_left"],
+                },
+            )
+            self.store.mark_domain_alert_sent(alert["job_id"], alert["days_left"])
 
     def register_email_feedback(self, bounces: int, complaints: int, sent: int) -> None:
         self.ops.add_channel_metrics("EMAIL", sent=sent, bounces=bounces, complaints=complaints)
