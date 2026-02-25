@@ -146,3 +146,11 @@ Esse endpoint classifica a resposta e atualiza o lead:
 - `positive` -> `CONSENTED`
 - `opt_out` -> `UNSUBSCRIBED`
 - demais -> `WAITING_REPLY`
+
+## Stripe (checkout + webhook)
+
+- Webhook de pagamento:
+  - `POST /webhooks/stripe`
+  - evento esperado: `checkout.session.completed`
+- Endpoint utilitario para gerar checkout manual:
+  - `POST /api/payments/checkout` com `{ "lead_id": 42, "plan": "COMPLETO" }`

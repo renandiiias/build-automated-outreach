@@ -169,10 +169,18 @@ def offer_email(
     unsubscribe_url: str,
     price_full: int = 200,
     price_simple: int = 100,
+    payment_url_full: str = "",
+    payment_url_simple: str = "",
 ) -> tuple[str, str, str]:
     subject = f"{name}: demo pronta + 2 opcoes"
     payment_block = ""
-    if payment_url.strip():
+    if payment_url_full.strip() or payment_url_simple.strip():
+        payment_block = (
+            "\n\nLinks de pagamento direto:\n"
+            f"- COMPLETO: {payment_url_full or '-'}\n"
+            f"- SIMPLES: {payment_url_simple or '-'}"
+        )
+    elif payment_url.strip():
         payment_block = (
             "\n\nSe preferir, tambem posso mandar o link de pagamento direto.\n"
             f"{payment_url}"

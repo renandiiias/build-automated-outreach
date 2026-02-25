@@ -11,6 +11,7 @@ from .crm_store import CrmStore
 from .logging_utils import JsonlLogger
 from .monitor_dashboard import build_snapshot, render_dashboard_html
 from .outreach import classify_codex_intent, detect_plan_choice, get_resend_client_from_env, is_opt_out_reply
+from .payment import get_stripe_client_from_env
 from .time_utils import UTC
 
 EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
@@ -20,6 +21,7 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
     store = CrmStore(get_config().state_db)
     logger = JsonlLogger(get_config().log_dir / "events.jsonl")
     email_client = get_resend_client_from_env()
+    stripe_client = get_stripe_client_from_env()
     codex_confidence_min = float(__import__("os").getenv("LEADGEN_REPLY_CONFIDENCE_MIN", "0.65"))
 
     def do_GET(self) -> None:  # noqa: N802
@@ -78,6 +80,9 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if parsed.path == "/api/payments/health":
+            self._send_json(200, {"stripe_configured": self.stripe_client is not None})
+            return
 
         if parsed.path == "/unsubscribe":
             self._handle_unsubscribe(parsed.query)
@@ -90,6 +95,9 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/webhooks/resend-inbound":
             self._handle_resend_inbound()
             return
+        if parsed.path == "/webhooks/stripe":
+            self._handle_stripe_webhook()
+            return
         if parsed.path.startswith("/api/replies/") and parsed.path.endswith("/codex-decision"):
             self._handle_codex_decision(parsed.path)
             return
@@ -101,6 +109,9 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/domains/") and parsed.path.endswith("/status"):
             self._handle_domain_status(parsed.path)
+            return
+        if parsed.path == "/api/payments/checkout":
+            self._handle_create_checkout()
             return
         self._send_json(404, {"ok": False, "error": "not_found"})
 
@@ -390,6 +401,91 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
             },
         )
         self._send_json(200, {"ok": True, "job_id": job_id, "status": status})
+
+    def _handle_create_checkout(self) -> None:
+        if not self.stripe_client:
+            self._send_json(500, {"ok": False, "error": "stripe_not_configured"})
+            return
+        payload = self._read_json()
+        try:
+            lead_id = int(payload.get("lead_id"))
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "invalid_lead_id"})
+            return
+        plan = str(payload.get("plan") or "COMPLETO").strip().upper()
+        context = self.store.get_lead_sale_context(lead_id)
+        if not context:
+            self._send_json(404, {"ok": False, "error": "lead_not_found"})
+            return
+        pricing = self.store.get_pricing_state()
+        amount = pricing.price_simple if plan == "SIMPLES" else pricing.price_full
+        success_url = str(payload.get("success_url") or "https://api.renandias.site/payment/success?session_id={CHECKOUT_SESSION_ID}")
+        cancel_url = str(payload.get("cancel_url") or "https://api.renandias.site/payment/cancel")
+        checkout = self.stripe_client.create_checkout_session(
+            amount_brl=amount,
+            lead_id=lead_id,
+            plan=plan,
+            business_name=context.get("business_name") or f"Lead {lead_id}",
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+        if not checkout.ok:
+            self._send_json(502, {"ok": False, "error": "stripe_checkout_failed", "detail": checkout.detail})
+            return
+        self._send_json(200, {"ok": True, "checkout_url": checkout.url, "session_id": checkout.session_id, "plan": plan, "amount_brl": amount})
+
+    def _handle_stripe_webhook(self) -> None:
+        payload = self._read_json()
+        event_type = str(payload.get("type") or "")
+        data_obj = payload.get("data", {}).get("object", {}) if isinstance(payload.get("data"), dict) else {}
+        if not isinstance(data_obj, dict):
+            data_obj = {}
+        if event_type != "checkout.session.completed":
+            self._send_json(200, {"ok": True, "ignored": True, "event_type": event_type})
+            return
+
+        metadata = data_obj.get("metadata", {}) if isinstance(data_obj.get("metadata"), dict) else {}
+        lead_id_raw = metadata.get("lead_id") or data_obj.get("client_reference_id")
+        plan = str(metadata.get("plan") or "COMPLETO").strip().upper()
+        try:
+            lead_id = int(lead_id_raw)
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "missing_lead_id"})
+            return
+
+        amount_total = data_obj.get("amount_total")
+        sale_amount = (float(amount_total) / 100.0) if isinstance(amount_total, (int, float)) else None
+        run_id = f"stripe-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        sale = self.store.mark_sale(
+            lead_id=lead_id,
+            run_id=run_id,
+            reason="stripe_webhook_checkout_completed",
+            accepted_plan=plan,
+            sale_amount=sale_amount,
+        )
+        self.logger.write(
+            "sale_marked",
+            {
+                "run_id": run_id,
+                "lead_id": lead_id,
+                "source": "stripe_webhook",
+                "accepted_plan": sale["accepted_plan"],
+                "sale_amount": sale["sale_amount"],
+            },
+        )
+        self.logger.write(
+            "pricing_level_up",
+            {
+                "run_id": run_id,
+                "lead_id": lead_id,
+                "from_level": sale["old_level"],
+                "to_level": sale["new_level"],
+                "accepted_plan": sale["accepted_plan"],
+                "sale_amount": sale["sale_amount"],
+            },
+        )
+        self.logger.write("domain_job_created", {"run_id": run_id, "lead_id": lead_id, "status": "DOMAIN_SELECTED"})
+        self._send_json(200, {"ok": True, "sale": sale})
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8787) -> None:

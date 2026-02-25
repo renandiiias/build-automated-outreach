@@ -19,6 +19,7 @@ from .enrichment import enrich_with_website_contacts
 from .incident import IncidentEngine
 from .logging_utils import JsonlLogger
 from .ops_state import OperationalState
+from .payment import get_stripe_client_from_env
 from .outreach import (
     detect_plan_choice,
     classify_reply,
@@ -56,6 +57,7 @@ class LeadPipelineRunner:
         self.scraper = GoogleMapsScraper()
         self.store = CrmStore(self.cfg.state_db)
         self.ops = OperationalState(self.cfg.ops_state_db)
+        self.stripe_client = get_stripe_client_from_env()
         self.incident_engine = IncidentEngine(
             db_path=self.cfg.log_dir / "incident_state.db",
             policy=self.cfg.incident,
@@ -68,6 +70,8 @@ class LeadPipelineRunner:
         preview_dir = Path(os.getenv("PREVIEW_PUBLISH_DIR", str(self.cfg.preview_dir)))
         self.demo_builder = DemoSiteBuilder(base_url=preview_base, publish_dir=preview_dir)
         self.unsubscribe_base = os.getenv("UNSUBSCRIBE_BASE_URL", preview_base)
+        self.payment_success_url = os.getenv("STRIPE_SUCCESS_URL", f"{preview_base}/payment/success?session_id={{CHECKOUT_SESSION_ID}}")
+        self.payment_cancel_url = os.getenv("STRIPE_CANCEL_URL", f"{preview_base}/payment/cancel")
         self.wa_daily_limit = int(os.getenv("LEADGEN_WA_DAILY_LIMIT", "40"))
         self.allow_relaxed_icp = os.getenv("LEADGEN_ALLOW_RELAXED_ICP", "1").strip().lower() in {"1", "true", "yes", "on"}
         self.email_only = os.getenv("LEADGEN_EMAIL_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -490,6 +494,33 @@ class LeadPipelineRunner:
             if lead.channel_preferred == "EMAIL" and lead.email and self.email_client and not self.ops.is_channel_paused("EMAIL"):
                 pricing = self.store.get_pricing_state()
                 unsub = build_unsubscribe_url(self.unsubscribe_base, lead.id, "EMAIL")
+                payment_url_full = ""
+                payment_url_simple = ""
+                if self.stripe_client:
+                    c_full = self.stripe_client.create_checkout_session(
+                        amount_brl=pricing.price_full,
+                        lead_id=lead.id,
+                        plan="COMPLETO",
+                        business_name=lead.business_name,
+                        success_url=self.payment_success_url,
+                        cancel_url=self.payment_cancel_url,
+                    )
+                    c_simple = self.stripe_client.create_checkout_session(
+                        amount_brl=pricing.price_simple,
+                        lead_id=lead.id,
+                        plan="SIMPLES",
+                        business_name=lead.business_name,
+                        success_url=self.payment_success_url,
+                        cancel_url=self.payment_cancel_url,
+                    )
+                    if c_full.ok:
+                        payment_url_full = c_full.url
+                    else:
+                        self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "stripe_checkout_full_failed", "detail": c_full.detail})
+                    if c_simple.ok:
+                        payment_url_simple = c_simple.url
+                    else:
+                        self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "stripe_checkout_simple_failed", "detail": c_simple.detail})
                 subject, body_text, html = offer_email(
                     lead.business_name,
                     demo.preview_url,
@@ -497,6 +528,8 @@ class LeadPipelineRunner:
                     unsub,
                     price_full=pricing.price_full,
                     price_simple=pricing.price_simple,
+                    payment_url_full=payment_url_full,
+                    payment_url_simple=payment_url_simple,
                 )
                 result = self.email_client.send(lead.email, subject, html)
                 self.store.save_touch(lead.id, "EMAIL", "OFFER", "email_offer_v1", result.status, result.message_id, body_text)
