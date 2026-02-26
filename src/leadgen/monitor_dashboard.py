@@ -11,6 +11,21 @@ from typing import Any
 from .config import get_config
 
 
+def _parse_utc(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _read_last_events(path: Path, max_lines: int = 200) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -104,6 +119,86 @@ def _country_channel_snapshot(db_path: Path) -> dict[str, Any]:
             {"country": country, "channel": channel, "touches": touches}
             for (country, channel), touches in sorted(country_channel_counter.items(), key=lambda it: (-it[1], it[0][0], it[0][1]))
         ],
+    }
+
+
+def _throughput_snapshot(db_path: Path, events: list[dict[str, Any]]) -> dict[str, Any]:
+    defaults = {
+        "touches_1h_total": 0,
+        "touches_24h_total": 0,
+        "touches_1h_by_channel": [],
+        "touches_24h_by_channel": [],
+        "new_leads_24h": 0,
+        "replies_24h": 0,
+        "offers_24h": 0,
+        "last_event_utc": "",
+        "last_event_age_min": None,
+    }
+    now = datetime.now(timezone.utc)
+    last_event_utc = ""
+    last_event_age_min: int | None = None
+    for event in reversed(events):
+        ts = _parse_utc(str(event.get("timestamp_utc", "")))
+        if ts:
+            last_event_utc = ts.isoformat()
+            last_event_age_min = max(0, int((now - ts).total_seconds() // 60))
+            break
+
+    if not db_path.exists():
+        defaults["last_event_utc"] = last_event_utc
+        defaults["last_event_age_min"] = last_event_age_min
+        return defaults
+
+    since_1h = (now - timedelta(hours=1)).isoformat()
+    since_24h = (now - timedelta(hours=24)).isoformat()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows_1h = conn.execute(
+                """
+                SELECT channel, COUNT(*)
+                FROM touches
+                WHERE timestamp_utc >= ?
+                GROUP BY channel
+                ORDER BY COUNT(*) DESC
+                """,
+                (since_1h,),
+            ).fetchall()
+            rows_24h = conn.execute(
+                """
+                SELECT channel, COUNT(*)
+                FROM touches
+                WHERE timestamp_utc >= ?
+                GROUP BY channel
+                ORDER BY COUNT(*) DESC
+                """,
+                (since_24h,),
+            ).fetchall()
+            new_leads_24h = int(
+                conn.execute("SELECT COUNT(*) FROM leads WHERE created_at_utc >= ?", (since_24h,)).fetchone()[0]
+            )
+            replies_24h = int(
+                conn.execute("SELECT COUNT(*) FROM replies WHERE timestamp_utc >= ?", (since_24h,)).fetchone()[0]
+            )
+            offers_24h = int(
+                conn.execute("SELECT COUNT(*) FROM offer_snapshots WHERE offered_at_utc >= ?", (since_24h,)).fetchone()[0]
+            )
+    except sqlite3.Error:
+        defaults["last_event_utc"] = last_event_utc
+        defaults["last_event_age_min"] = last_event_age_min
+        return defaults
+
+    touches_1h = [{"channel": str(r[0] or "UNKNOWN"), "count": int(r[1])} for r in rows_1h]
+    touches_24h = [{"channel": str(r[0] or "UNKNOWN"), "count": int(r[1])} for r in rows_24h]
+    return {
+        "touches_1h_total": sum(int(r["count"]) for r in touches_1h),
+        "touches_24h_total": sum(int(r["count"]) for r in touches_24h),
+        "touches_1h_by_channel": touches_1h,
+        "touches_24h_by_channel": touches_24h,
+        "new_leads_24h": new_leads_24h,
+        "replies_24h": replies_24h,
+        "offers_24h": offers_24h,
+        "last_event_utc": last_event_utc,
+        "last_event_age_min": last_event_age_min,
     }
 
 
@@ -358,6 +453,7 @@ def build_snapshot() -> dict[str, Any]:
         "pricing": _pricing_snapshot(cfg.state_db),
         "funnel_7d": _funnel_7d(cfg.state_db),
         "geo_channels": _country_channel_snapshot(cfg.state_db),
+        "throughput": _throughput_snapshot(cfg.state_db, events),
         "domain_ops": _domain_ops_snapshot(cfg.state_db),
         "reply_queue": _reply_queue_snapshot(cfg.state_db),
         "events_summary": _compute_event_summary(events),
@@ -409,15 +505,37 @@ def render_dashboard_html() -> str:
     domains = snap["domain_ops"]
     ops = snap["ops"]
     geo = snap["geo_channels"]
+    throughput = snap["throughput"]
     es = snap["events_summary"]
     progress_pct = min(100, int((pricing["offers_in_window"] / 10) * 100))
     safe_mode = "ATIVO" if ops["global_safe_mode"] else "DESATIVADO"
     safe_class = "bad" if ops["global_safe_mode"] else "ok"
     baseline_txt = f"{pricing['baseline_conversion'] * 100:.1f}%" if pricing["baseline_conversion"] is not None else "n/a"
     conv_txt = f"{funnel['conversion_7d'] * 100:.1f}%"
+    event_age = throughput.get("last_event_age_min")
+    if event_age is None:
+        activity_txt = "Sem atividade recente"
+        activity_class = "warn"
+    elif event_age <= 3:
+        activity_txt = "Agora mesmo"
+        activity_class = "ok"
+    elif event_age <= 20:
+        activity_txt = f"{event_age} min atras"
+        activity_class = "ok"
+    elif event_age <= 60:
+        activity_txt = f"{event_age} min atras"
+        activity_class = "warn"
+    else:
+        activity_txt = f"{event_age} min atras"
+        activity_class = "bad"
     lead_total_geo = max(1, sum(int(it["leads"]) for it in geo["by_country"]))
     max_channel_touches = max([int(it["touches"]) for it in geo["approaches_by_channel"]] or [1])
     max_country_channel_touches = max([int(it["touches"]) for it in geo["approaches_by_country_channel"]] or [1])
+    ch_1h = {str(it["channel"]): int(it["count"]) for it in throughput["touches_1h_by_channel"]}
+    ch_24h = {str(it["channel"]): int(it["count"]) for it in throughput["touches_24h_by_channel"]}
+    pace_channels = sorted(set(ch_1h.keys()) | set(ch_24h.keys()))
+    pace_max_1h = max([ch_1h.get(ch, 0) for ch in pace_channels] or [1])
+    pace_max_24h = max([ch_24h.get(ch, 0) for ch in pace_channels] or [1])
 
     stage_funnel = [
         ("Leads 7d", funnel["leads_7d"]),
@@ -448,21 +566,29 @@ def render_dashboard_html() -> str:
             f"<td><div class='meter'><i style='width:{max(4, int((int(it['leads']) / lead_total_geo) * 100))}%'></i></div></td></tr>"
         )
         for it in geo["by_country"]
-    ) or "<tr><td colspan='2'>Sem dados por pais.</td></tr>"
+    ) or "<tr><td colspan='3'>Sem dados por pais.</td></tr>"
     approach_channel_rows = "".join(
         (
             f"<tr><td><b>{it['channel']}</b></td><td>{it['touches']}</td>"
             f"<td><div class='meter'><i style='width:{max(4, int((int(it['touches']) / max_channel_touches) * 100))}%'></i></div></td></tr>"
         )
         for it in geo["approaches_by_channel"]
-    ) or "<tr><td colspan='2'>Sem abordagens registradas.</td></tr>"
+    ) or "<tr><td colspan='3'>Sem abordagens registradas.</td></tr>"
     approach_country_channel_rows = "".join(
         (
             f"<tr><td>{it['country']}</td><td>{it['channel']}</td><td>{it['touches']}</td>"
             f"<td><div class='meter'><i style='width:{max(4, int((int(it['touches']) / max_country_channel_touches) * 100))}%'></i></div></td></tr>"
         )
         for it in geo["approaches_by_country_channel"][:20]
-    ) or "<tr><td colspan='3'>Sem cruzamento pais/canal.</td></tr>"
+    ) or "<tr><td colspan='4'>Sem cruzamento pais/canal.</td></tr>"
+    pace_rows = "".join(
+        (
+            f"<tr><td><b>{ch}</b></td><td>{ch_1h.get(ch, 0)}</td><td>{ch_24h.get(ch, 0)}</td>"
+            f"<td><div class='meter'><i style='width:{max(4, int((ch_24h.get(ch, 0) / pace_max_24h) * 100))}%'></i></div></td>"
+            f"<td><div class='meter meter-cool'><i style='width:{max(4, int((ch_1h.get(ch, 0) / pace_max_1h) * 100))}%'></i></div></td></tr>"
+        )
+        for ch in pace_channels
+    ) or "<tr><td colspan='5'>Sem ritmo por canal ainda.</td></tr>"
 
     event_rows = ""
     for e in reversed(snap["events"][-18:]):
@@ -527,6 +653,12 @@ def render_dashboard_html() -> str:
       background: #fff;
       color: var(--muted);
     }}
+    .badge-activity {{
+      color: #0f172a;
+      font-weight: 700;
+      background: #eff6ff;
+      border-color: #bfdbfe;
+    }}
     .grid {{ display: grid; gap: 10px; }}
     .kpis {{ grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }}
     .split {{ grid-template-columns: 1.6fr 1fr; }}
@@ -582,6 +714,9 @@ def render_dashboard_html() -> str:
       height:100%;
       background: linear-gradient(90deg, var(--brand), var(--accent));
     }}
+    .meter-cool > i {{
+      background: linear-gradient(90deg, #0ea5e9, #6366f1);
+    }}
     .compact {{ max-height: 420px; overflow: auto; }}
     @media (max-width: 940px) {{
       .split, .triple {{ grid-template-columns: 1fr; }}
@@ -597,6 +732,13 @@ def render_dashboard_html() -> str:
       <span class='badge'>Atualizacao automatica: 10s</span>
     </div>
     <p>Atualizado em {snap['generated_at_utc']} (UTC). Status global: <b class='{safe_class}'>{safe_mode}</b>.</p>
+    <div class='hero-top' style='margin-top:8px'>
+      <span class='badge badge-activity'>Ultima atividade: <b class='{activity_class}'>{activity_txt}</b></span>
+      <span class='badge'>Abordagens 1h: <b>{throughput['touches_1h_total']}</b></span>
+      <span class='badge'>Abordagens 24h: <b>{throughput['touches_24h_total']}</b></span>
+      <span class='badge'>Leads novos 24h: <b>{throughput['new_leads_24h']}</b></span>
+      <span class='badge'>Respostas 24h: <b>{throughput['replies_24h']}</b></span>
+    </div>
   </section>
 
   <section class='grid kpis'>
@@ -650,6 +792,14 @@ def render_dashboard_html() -> str:
         Entregues: {es['contact_delivered']} | Falhas: {es['contact_failed']} | Ofertas enviadas: {es['offer_sent']}
       </div>
     </div>
+  </section>
+
+  <section class='card' style='margin-top:10px'>
+    <h2>Ritmo por Canal (1h vs 24h)</h2>
+    <table>
+      <thead><tr><th>Canal</th><th>1h</th><th>24h</th><th>Volume 24h</th><th>Intensidade 1h</th></tr></thead>
+      <tbody>{pace_rows}</tbody>
+    </table>
   </section>
 
   <section class='grid split' style='margin-top:10px'>
