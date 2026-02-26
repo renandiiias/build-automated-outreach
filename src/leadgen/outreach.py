@@ -110,34 +110,77 @@ def build_unsubscribe_url(base_url: str, lead_id: int, channel: str) -> str:
     return f"{base_url.rstrip('/')}/unsubscribe?{query}"
 
 
+def _is_pt_br(locale: str) -> bool:
+    return (locale or "").strip().lower().startswith("pt")
+
+
+def _money(amount: int, currency_code: str, locale: str) -> str:
+    if _is_pt_br(locale):
+        return f"R$ {amount}"
+    code = (currency_code or "EUR").strip().upper()
+    if code == "EUR":
+        return f"EUR {amount}"
+    return f"{code} {amount}"
+
+
 def initial_consent_email(
     name: str,
     unsubscribe_url: str,
     variant: int = 1,
     city: str = "",
     has_website: bool = False,
+    locale: str = "en",
 ) -> tuple[str, str, str]:
     _ = variant
-    subject = f"{name}: can I send you a free homepage concept?"
+    if _is_pt_br(locale):
+        subject = f"{name}: posso te enviar uma ideia gratuita da sua pagina?"
+    else:
+        subject = f"{name}: can I send you a free homepage concept?"
     city_hint = city.strip() or "your area"
-    positioning = (
-        "I checked your current site and I can build a much more impactful version focused on calls and bookings.\n\n"
-        if has_website
-        else "I noticed there is a clear opportunity to convert more visitors into calls and WhatsApp leads.\n\n"
-    )
-    body = (
-        f"Hi {name} team,\n\n"
-        f"I found your Google Business listing in {city_hint}. "
-        f"{positioning}"
-        "I can build a free concept page and send it over today, no commitment.\n\n"
-        "If you do not want more messages, unsubscribe here: "
-        f"{unsubscribe_url}"
-    )
+    if _is_pt_br(locale):
+        city_hint = city.strip() or "sua regiao"
+        positioning = (
+            "Vi o site atual de voces e consigo criar uma versao bem mais impactante para gerar mais contatos.\n\n"
+            if has_website
+            else "Vi uma oportunidade clara para converter mais visitas em mensagens e ligacoes.\n\n"
+        )
+        body = (
+            f"Oi, equipe {name}.\n\n"
+            f"Encontrei a ficha de voces no Google em {city_hint}. "
+            f"{positioning}"
+            "Posso montar uma versao conceito gratuita e te enviar hoje, sem compromisso.\n\n"
+            "Se nao quiser mais mensagens, descadastre aqui: "
+            f"{unsubscribe_url}"
+        )
+    else:
+        positioning = (
+            "I checked your current site and I can build a much more impactful version focused on calls and bookings.\n\n"
+            if has_website
+            else "I noticed there is a clear opportunity to convert more visitors into calls and WhatsApp leads.\n\n"
+        )
+        body = (
+            f"Hi {name} team,\n\n"
+            f"I found your Google Business listing in {city_hint}. "
+            f"{positioning}"
+            "I can build a free concept page and send it over today, no commitment.\n\n"
+            "If you do not want more messages, unsubscribe here: "
+            f"{unsubscribe_url}"
+        )
     html = body.replace("\n", "<br>")
     return subject, body, html
 
 
-def initial_consent_whatsapp(name: str, has_website: bool = False) -> str:
+def initial_consent_whatsapp(name: str, has_website: bool = False, locale: str = "en") -> str:
+    if _is_pt_br(locale):
+        pitch = (
+            "Vi o site atual de voces e consigo fazer uma versao muito mais impactante para conversao."
+            if has_website
+            else "Vi o perfil de voces no Google e consigo montar uma pagina de alta conversao."
+        )
+        return (
+            f"Oi {name}! {pitch} "
+            "Quer que eu te envie uma ideia gratuita? Responde SIM. Para parar, responde PARAR."
+        )
     pitch = (
         "I saw your current website and I can build a way more impactful version for conversions."
         if has_website
@@ -149,38 +192,85 @@ def initial_consent_whatsapp(name: str, has_website: bool = False) -> str:
     )
 
 
-def followup_consent_email(name: str, unsubscribe_url: str, step: int, has_website: bool = False) -> tuple[str, str, str]:
-    subject = f"{name}: 3 fast upgrades to get more enquiries"
+def followup_consent_email(
+    name: str,
+    unsubscribe_url: str,
+    step: int,
+    has_website: bool = False,
+    locale: str = "en",
+) -> tuple[str, str, str]:
+    if _is_pt_br(locale):
+        subject = f"{name}: 3 ajustes rapidos para gerar mais contatos"
+    else:
+        subject = f"{name}: 3 fast upgrades to get more enquiries"
     first_line = (
         "Since you already have a site, these are focused on lifting conversion without adding complexity:\n\n"
         if has_website
         else "Here are 3 simple upgrades that usually increase local enquiries:\n\n"
     )
-    body = (
-        f"Hi {name} team,\n\n"
-        f"{first_line}"
-        "1) Clear headline with service + area in the hero.\n"
-        "2) Strong call-to-action above the fold.\n"
-        "3) Local proof (reviews, neighborhoods served, response time).\n\n"
-        "If helpful, I can send a free concept with this applied today.\n\n"
-        "Opt-out: "
-        f"{unsubscribe_url}"
-    )
-    if step >= 2:
-        subject = f"{name}: should I close this thread?"
+    if _is_pt_br(locale):
+        first_line = (
+            "Como voces ja tem site, esses ajustes focam em aumentar conversao sem complicar:\n\n"
+            if has_website
+            else "Aqui vao 3 ajustes simples que normalmente aumentam contatos locais:\n\n"
+        )
         body = (
-            f"Hi {name} team,\n\n"
-            "This is my last follow-up about the free concept.\n\n"
-            "If you want it, I can send it today.\n"
-            "If timing is not ideal, I will close this here.\n\n"
+            f"Oi, equipe {name}.\n\n"
+            f"{first_line}"
+            "1) Titulo claro com servico + regiao no topo.\n"
+            "2) CTA forte na primeira dobra.\n"
+            "3) Prova local (avaliacoes, bairros atendidos, tempo de resposta).\n\n"
+            "Se fizer sentido, eu te envio um conceito gratuito com isso aplicado hoje.\n\n"
             "Opt-out: "
             f"{unsubscribe_url}"
         )
+    else:
+        body = (
+            f"Hi {name} team,\n\n"
+            f"{first_line}"
+            "1) Clear headline with service + area in the hero.\n"
+            "2) Strong call-to-action above the fold.\n"
+            "3) Local proof (reviews, neighborhoods served, response time).\n\n"
+            "If helpful, I can send a free concept with this applied today.\n\n"
+            "Opt-out: "
+            f"{unsubscribe_url}"
+        )
+    if step >= 2:
+        if _is_pt_br(locale):
+            subject = f"{name}: encerro por aqui?"
+            body = (
+                f"Oi, equipe {name}.\n\n"
+                "Esse e meu ultimo follow-up sobre o conceito gratuito.\n\n"
+                "Se quiser, te envio hoje.\n"
+                "Se nao for o momento, eu encerro por aqui.\n\n"
+                "Opt-out: "
+                f"{unsubscribe_url}"
+            )
+        else:
+            subject = f"{name}: should I close this thread?"
+            body = (
+                f"Hi {name} team,\n\n"
+                "This is my last follow-up about the free concept.\n\n"
+                "If you want it, I can send it today.\n"
+                "If timing is not ideal, I will close this here.\n\n"
+                "Opt-out: "
+                f"{unsubscribe_url}"
+            )
     return subject, body, body.replace("\n", "<br>")
 
 
-def followup_consent_whatsapp(name: str, step: int, has_website: bool = False) -> str:
+def followup_consent_whatsapp(name: str, step: int, has_website: bool = False, locale: str = "en") -> str:
     _ = has_website
+    if _is_pt_br(locale):
+        if step >= 2:
+            return (
+                f"{name}, ultimo toque sobre o conceito gratuito. "
+                "Se quiser, responde SIM e te envio hoje. Para parar, responde PARAR."
+            )
+        return (
+            f"{name}, ainda tem interesse em receber o conceito gratuito? "
+            "Posso preparar hoje. Para parar mensagens, responde PARAR."
+        )
     if step >= 2:
         return (
             f"{name}, quick last follow-up on the free concept. "
@@ -198,12 +288,16 @@ def offer_email(
     payment_url: str,
     unsubscribe_url: str,
     has_website: bool = False,
+    locale: str = "en",
+    currency_code: str = "EUR",
     price_full: int = 200,
     price_simple: int = 100,
     payment_url_full: str = "",
     payment_url_simple: str = "",
 ) -> tuple[str, str, str]:
     subject = f"{name}: concept ready + 2 options"
+    if _is_pt_br(locale):
+        subject = f"{name}: conceito pronto + 2 opcoes"
     payment_block = ""
     if payment_url_full.strip() or payment_url_simple.strip():
         payment_block = (
@@ -216,54 +310,123 @@ def offer_email(
             "\n\nIf you prefer, I can also send a direct payment link:\n"
             f"{payment_url}"
         )
-    framing = (
-        "Built as a stronger, more conversion-focused upgrade to your current site."
-        if has_website
-        else "Built to give your business a clear, high-converting online presence."
-    )
-    body = (
-        f"Awesome, {name} team.\n\n"
-        f"Your concept is ready:\n{preview_url}\n\n"
-        f"{framing}\n\n"
-        "Offer:\n\n"
-        f"Complete: EUR {price_full}\n"
-        f"Simple: EUR {price_simple}\n\n"
-        "Both include publishing and 1 year live hosting. "
-        "Complete includes deeper conversion structure and stronger content blocks.\n\n"
-        "To proceed, reply \"COMPLETE\" or \"SIMPLE\" and I publish right away."
-        f"{payment_block}\n\n"
-        "Opt-out: "
-        f"{unsubscribe_url}"
-    )
-    html = body.replace("\n", "<br>")
-    return subject, body, html
-
-
-def offer_followup_email(name: str, unsubscribe_url: str, step: int, has_website: bool = False) -> tuple[str, str, str]:
-    _ = has_website
-    if step <= 1:
-        subject = f"{name}: want me to publish today?"
+    if _is_pt_br(locale):
+        framing = (
+            "Estruturado como uma versao mais forte e focada em conversao do site atual."
+            if has_website
+            else "Estruturado para dar presenca digital forte e converter melhor."
+        )
         body = (
-            f"Hi {name} team,\n\n"
-            "I can publish your final version today.\n"
-            "Reply with \"COMPLETE\" or \"SIMPLE\" and I execute immediately.\n\n"
+            f"Perfeito, equipe {name}.\n\n"
+            f"Seu conceito ficou pronto:\n{preview_url}\n\n"
+            f"{framing}\n\n"
+            "Proposta:\n\n"
+            f"Completo: {_money(price_full, currency_code, locale)}\n"
+            f"Simples: {_money(price_simple, currency_code, locale)}\n\n"
+            "Os dois incluem publicacao e 1 ano no ar.\n\n"
+            "Se quiser seguir, responde \"COMPLETO\" ou \"SIMPLES\" que eu publico em seguida."
+            f"{payment_block}\n\n"
             "Opt-out: "
             f"{unsubscribe_url}"
         )
     else:
-        subject = f"{name}: should we finalize this today?"
+        framing = (
+            "Built as a stronger, more conversion-focused upgrade to your current site."
+            if has_website
+            else "Built to give your business a clear, high-converting online presence."
+        )
         body = (
-            f"Hi {name} team,\n\n"
-            "I will close this cycle today so I do not over-message you.\n"
-            "If you want to publish, reply \"COMPLETE\" or \"SIMPLE\" by end of day.\n\n"
-            "If timing is not ideal, no worries, I will close this thread.\n\n"
+            f"Awesome, {name} team.\n\n"
+            f"Your concept is ready:\n{preview_url}\n\n"
+            f"{framing}\n\n"
+            "Offer:\n\n"
+            f"Complete: {_money(price_full, currency_code, locale)}\n"
+            f"Simple: {_money(price_simple, currency_code, locale)}\n\n"
+            "Both include publishing and 1 year live hosting. "
+            "Complete includes deeper conversion structure and stronger content blocks.\n\n"
+            "To proceed, reply \"COMPLETE\" or \"SIMPLE\" and I publish right away."
+            f"{payment_block}\n\n"
             "Opt-out: "
             f"{unsubscribe_url}"
         )
+    html = body.replace("\n", "<br>")
+    return subject, body, html
+
+
+def offer_followup_email(
+    name: str,
+    unsubscribe_url: str,
+    step: int,
+    has_website: bool = False,
+    locale: str = "en",
+) -> tuple[str, str, str]:
+    _ = has_website
+    if step <= 1:
+        if _is_pt_br(locale):
+            subject = f"{name}: quer que eu publique hoje?"
+            body = (
+                f"Oi, equipe {name}.\n\n"
+                "Consigo publicar a versao final hoje.\n"
+                "Responde com \"COMPLETO\" ou \"SIMPLES\" que eu executo em seguida.\n\n"
+                "Opt-out: "
+                f"{unsubscribe_url}"
+            )
+        else:
+            subject = f"{name}: want me to publish today?"
+            body = (
+                f"Hi {name} team,\n\n"
+                "I can publish your final version today.\n"
+                "Reply with \"COMPLETE\" or \"SIMPLE\" and I execute immediately.\n\n"
+                "Opt-out: "
+                f"{unsubscribe_url}"
+            )
+    else:
+        if _is_pt_br(locale):
+            subject = f"{name}: finalizamos hoje?"
+            body = (
+                f"Oi, equipe {name}.\n\n"
+                "Fecho esse ciclo hoje para nao te incomodar demais.\n"
+                "Se quiser publicar, responde \"COMPLETO\" ou \"SIMPLES\" ate o fim do dia.\n\n"
+                "Se nao for o momento, sem problema, eu encerro por aqui.\n\n"
+                "Opt-out: "
+                f"{unsubscribe_url}"
+            )
+        else:
+            subject = f"{name}: should we finalize this today?"
+            body = (
+                f"Hi {name} team,\n\n"
+                "I will close this cycle today so I do not over-message you.\n"
+                "If you want to publish, reply \"COMPLETE\" or \"SIMPLE\" by end of day.\n\n"
+                "If timing is not ideal, no worries, I will close this thread.\n\n"
+                "Opt-out: "
+                f"{unsubscribe_url}"
+            )
     return subject, body, body.replace("\n", "<br>")
 
 
-def offer_whatsapp(name: str, preview_url: str, payment_url: str, has_website: bool = False, price_full: int = 100, price_simple: int = 50) -> str:
+def offer_whatsapp(
+    name: str,
+    preview_url: str,
+    payment_url: str,
+    has_website: bool = False,
+    price_full: int = 100,
+    price_simple: int = 50,
+    locale: str = "en",
+    currency_code: str = "EUR",
+) -> str:
+    if _is_pt_br(locale):
+        framing = (
+            "Fiz esse conceito como upgrade de conversao do site atual."
+            if has_website
+            else "Fiz esse conceito para destacar seu negocio e converter melhor."
+        )
+        return (
+            f"{name}, seu conceito ficou pronto: {preview_url}\n\n"
+            f"{framing}\n\n"
+            f"Opcoes para publicar hoje:\n- COMPLETO ({_money(price_full, currency_code, locale)})\n- SIMPLES ({_money(price_simple, currency_code, locale)})\n\n"
+            f"Quer o link de pagamento agora? {payment_url}\n\n"
+            "Para parar mensagens, responda PARAR."
+        )
     framing = (
         "I built this as a stronger conversion-focused upgrade to your current site."
         if has_website
@@ -272,7 +435,7 @@ def offer_whatsapp(name: str, preview_url: str, payment_url: str, has_website: b
     return (
         f"{name}, your concept is ready: {preview_url}\n\n"
         f"{framing}\n\n"
-        f"Options to publish today:\n- COMPLETE (EUR {price_full})\n- SIMPLE (EUR {price_simple})\n\n"
+        f"Options to publish today:\n- COMPLETE ({_money(price_full, currency_code, locale)})\n- SIMPLE ({_money(price_simple, currency_code, locale)})\n\n"
         f"Want the payment link now? {payment_url}\n\n"
         "To stop messages, reply STOP."
     )

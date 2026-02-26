@@ -419,10 +419,12 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
             return
         pricing = self.store.get_pricing_state()
         amount = pricing.price_simple if plan == "SIMPLES" else pricing.price_full
+        currency = str(payload.get("currency") or "brl").strip().lower()
         success_url = str(payload.get("success_url") or "https://api.renandias.site/payment/success?session_id={CHECKOUT_SESSION_ID}")
         cancel_url = str(payload.get("cancel_url") or "https://api.renandias.site/payment/cancel")
         checkout = self.stripe_client.create_checkout_session(
-            amount_brl=amount,
+            amount_value=amount,
+            currency=currency,
             lead_id=lead_id,
             plan=plan,
             business_name=context.get("business_name") or f"Lead {lead_id}",
@@ -432,7 +434,7 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         if not checkout.ok:
             self._send_json(502, {"ok": False, "error": "stripe_checkout_failed", "detail": checkout.detail})
             return
-        self._send_json(200, {"ok": True, "checkout_url": checkout.url, "session_id": checkout.session_id, "plan": plan, "amount_brl": amount})
+        self._send_json(200, {"ok": True, "checkout_url": checkout.url, "session_id": checkout.session_id, "plan": plan, "amount": amount, "currency": currency})
 
     def _handle_stripe_webhook(self) -> None:
         payload = self._read_json()

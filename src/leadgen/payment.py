@@ -23,25 +23,28 @@ class StripeCheckoutClient:
     def create_checkout_session(
         self,
         *,
-        amount_brl: int,
+        amount_value: int,
+        currency: str,
         lead_id: int,
         plan: str,
         business_name: str,
         success_url: str,
         cancel_url: str,
     ) -> CheckoutResult:
-        amount_cents = max(100, int(amount_brl) * 100)
+        amount_cents = max(100, int(amount_value) * 100)
+        currency_code = (currency or "brl").strip().lower()
         payload = {
             "mode": "payment",
             "success_url": success_url,
             "cancel_url": cancel_url,
-            "line_items[0][price_data][currency]": "brl",
+            "line_items[0][price_data][currency]": currency_code,
             "line_items[0][price_data][unit_amount]": str(amount_cents),
             "line_items[0][price_data][product_data][name]": f"Site {plan} - {business_name}",
             "line_items[0][quantity]": "1",
             "metadata[lead_id]": str(lead_id),
             "metadata[plan]": str(plan),
-            "metadata[amount_brl]": str(amount_brl),
+            "metadata[amount]": str(amount_value),
+            "metadata[currency]": currency_code,
         }
         req = Request(
             "https://api.stripe.com/v1/checkout/sessions",

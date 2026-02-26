@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -244,7 +245,8 @@ class LeadPipelineRunner:
             self.logger.write("safe_mode_enabled", {"run_id": run_id, "reason": "global_safe_mode_blocks_outreach"})
             return 0
 
-        leads = self.store.list_leads_for_initial_contact(limit=250)
+        scope = self._outreach_scope_from_run_id(run_id)
+        leads = self.store.list_leads_for_initial_contact(limit=250, run_id_prefix=scope)
         count = 0
         day_index = self._campaign_day_index()
         email_limit = email_warmup_daily_limit(day_index)
@@ -289,6 +291,7 @@ class LeadPipelineRunner:
                     variant=variant,
                     city=lead.address,
                     has_website=bool((lead.website or "").strip()),
+                    locale=self._lead_locale(lead.phone, lead.address),
                 )
                 sent = self.email_client.send(lead.email, subject, html)
                 self.store.save_touch(lead.id, "EMAIL", "CONSENT_REQUEST", f"email_v{variant}", sent.status, sent.message_id, body_text)
@@ -331,6 +334,7 @@ class LeadPipelineRunner:
                 msg = initial_consent_whatsapp(
                     lead.business_name,
                     has_website=bool((lead.website or "").strip()),
+                    locale=self._lead_locale(lead.phone, lead.address),
                 )
                 sent = self.wa_client.send(normalized, msg)
                 self.store.save_touch(lead.id, "WHATSAPP", "CONSENT_REQUEST", "wa_v1", sent.status, sent.message_id, msg)
@@ -380,6 +384,7 @@ class LeadPipelineRunner:
                     unsub,
                     step=step,
                     has_website=bool((lead.website or "").strip()),
+                    locale=self._lead_locale(lead.phone, lead.address),
                 )
                 sent = self.email_client.send(lead.email, subject, html)
                 self.store.save_touch(lead.id, "EMAIL", "CONSENT_REQUEST", f"email_followup_{step}", sent.status, sent.message_id, body_text)
@@ -396,6 +401,7 @@ class LeadPipelineRunner:
                     lead.business_name,
                     step=step,
                     has_website=bool((lead.website or "").strip()),
+                    locale=self._lead_locale(lead.phone, lead.address),
                 )
                 sent = self.wa_client.send(normalized, body)
                 self.store.save_touch(lead.id, "WHATSAPP", "CONSENT_REQUEST", f"wa_followup_{step}", sent.status, sent.message_id, body)
@@ -428,6 +434,7 @@ class LeadPipelineRunner:
                 unsub,
                 step=next_step,
                 has_website=bool((lead.website or "").strip()),
+                locale=self._lead_locale(lead.phone, lead.address),
             )
             sent = self.email_client.send(lead.email, subject, html)
             self.store.save_touch(lead.id, "EMAIL", "OFFER", f"email_offer_followup_{next_step}", sent.status, sent.message_id, body_text)
@@ -508,12 +515,15 @@ class LeadPipelineRunner:
 
             if lead.channel_preferred == "EMAIL" and lead.email and self.email_client and not self.ops.is_channel_paused("EMAIL"):
                 pricing = self.store.get_pricing_state()
+                locale = self._lead_locale(lead.phone, lead.address)
+                regional_full, regional_simple, regional_currency = self._regional_prices(locale, pricing)
                 unsub = build_unsubscribe_url(self.unsubscribe_base, lead.id, "EMAIL")
                 payment_url_full = ""
                 payment_url_simple = ""
                 if self.stripe_client:
                     c_full = self.stripe_client.create_checkout_session(
-                        amount_brl=pricing.price_full,
+                        amount_value=regional_full,
+                        currency=regional_currency,
                         lead_id=lead.id,
                         plan="COMPLETO",
                         business_name=lead.business_name,
@@ -521,7 +531,8 @@ class LeadPipelineRunner:
                         cancel_url=self.payment_cancel_url,
                     )
                     c_simple = self.stripe_client.create_checkout_session(
-                        amount_brl=pricing.price_simple,
+                        amount_value=regional_simple,
+                        currency=regional_currency,
                         lead_id=lead.id,
                         plan="SIMPLES",
                         business_name=lead.business_name,
@@ -542,8 +553,10 @@ class LeadPipelineRunner:
                     payment_url,
                     unsub,
                     has_website=bool((lead.website or "").strip()),
-                    price_full=pricing.price_full,
-                    price_simple=pricing.price_simple,
+                    locale=locale,
+                    currency_code=regional_currency,
+                    price_full=regional_full,
+                    price_simple=regional_simple,
                     payment_url_full=payment_url_full,
                     payment_url_simple=payment_url_simple,
                 )
@@ -597,13 +610,17 @@ class LeadPipelineRunner:
                 phone = normalize_phone_br(lead.phone)
                 if phone:
                     pricing = self.store.get_pricing_state()
+                    locale = self._lead_locale(lead.phone, lead.address)
+                    regional_full, regional_simple, regional_currency = self._regional_prices(locale, pricing)
                     body = offer_whatsapp(
                         lead.business_name,
                         demo.preview_url,
                         payment_url,
                         has_website=bool((lead.website or "").strip()),
-                        price_full=pricing.price_full,
-                        price_simple=pricing.price_simple,
+                        price_full=regional_full,
+                        price_simple=regional_simple,
+                        locale=locale,
+                        currency_code=regional_currency,
                     )
                     result = self.wa_client.send(phone, body)
                     self.store.save_touch(lead.id, "WHATSAPP", "OFFER", "wa_offer_v1", result.status, result.message_id, body)
@@ -740,6 +757,35 @@ class LeadPipelineRunner:
         now = datetime.now(UTC)
         delta = now.date() - first.date()
         return max(1, delta.days + 1)
+
+    @staticmethod
+    def _outreach_scope_from_run_id(run_id: str) -> str:
+        rid = (run_id or "").strip()
+        if "-c" in rid:
+            return rid.split("-c", 1)[0]
+        if rid.startswith("window-"):
+            return rid
+        return ""
+
+    @staticmethod
+    def _lead_locale(phone: str, address: str) -> str:
+        digits = re.sub(r"\D+", "", phone or "")
+        addr = (address or "").lower()
+        if digits.startswith("55"):
+            return "pt-BR"
+        if any(tok in addr for tok in ["brasil", "brazil", "sao paulo", "rio de janeiro", "belo horizonte", "fortaleza", "salvador", "recife"]):
+            return "pt-BR"
+        if re.search(r"\b(sp|rj|mg|ba|ce|pr|rs|sc|go|df)\b", addr):
+            return "pt-BR"
+        return "en"
+
+    @staticmethod
+    def _regional_prices(locale: str, pricing) -> tuple[int, int, str]:
+        if (locale or "").lower().startswith("pt"):
+            full = int(os.getenv("LEADGEN_PRICE_BR_FULL", "200") or "200")
+            simple = int(os.getenv("LEADGEN_PRICE_BR_SIMPLE", "100") or "100")
+            return full, simple, "brl"
+        return int(pricing.price_full), int(pricing.price_simple), "eur"
 
     def _register_incident(self, run_id: str, error_type: str, message: str, context: dict[str, str]) -> None:
         merged_context = {"run_id": run_id, **context}

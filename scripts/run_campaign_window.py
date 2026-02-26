@@ -141,6 +141,7 @@ def _run_with_timeout(seconds: int, fn, *args, **kwargs):
 
 def _run_ingest_subprocess(
     *,
+    run_id: str,
     audience: str,
     location: str,
     max_results: int,
@@ -152,6 +153,8 @@ def _run_ingest_subprocess(
         sys.executable,
         str(ROOT / "scripts" / "run_pipeline.py"),
         "ingest",
+        "--run-id",
+        run_id,
         "--audience",
         audience,
         "--location",
@@ -235,6 +238,7 @@ def main() -> int:
         runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "ingest"})
         try:
             ingested = _run_ingest_subprocess(
+                run_id=cycle_id,
                 audience=audience_now,
                 location=location_now,
                 max_results=args.max_results,

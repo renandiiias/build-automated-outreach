@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser("ingest", help="Executa apenas scraping/qualificacao")
     _add_common_search_args(ingest)
+    ingest.add_argument("--run-id", default="manual", help="Run id para correlacao de logs")
 
     outreach = sub.add_parser("outreach", help="Executa apenas primeiro contato (consent-first)")
     outreach.add_argument("--run-id", default="manual", help="Run id para correlacao de logs")
@@ -94,7 +95,7 @@ def main() -> int:
 
     if args.command == "ingest":
         n = runner.ingest(
-            run_id="manual",
+            run_id=args.run_id,
             audience=args.audience,
             location=args.location,
             max_results=args.max_results,

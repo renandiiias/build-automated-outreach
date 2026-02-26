@@ -294,17 +294,31 @@ class CrmStore:
             row = conn.execute("SELECT COUNT(*) FROM leads").fetchone()
         return int(row[0]) if row else 0
 
-    def list_leads_for_initial_contact(self, limit: int = 100) -> list[Lead]:
+    def list_leads_for_initial_contact(self, limit: int = 100, run_id_prefix: str = "") -> list[Lead]:
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, run_id, business_name, maps_url, phone, email, website, address, stage, channel_preferred, opt_out
-                FROM leads
-                WHERE stage IN ('NEW', 'QUALIFIED') AND opt_out = 0 AND channel_preferred IN ('EMAIL', 'WHATSAPP')
-                ORDER BY CASE WHEN channel_preferred='EMAIL' THEN 0 ELSE 1 END, id ASC LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if run_id_prefix.strip():
+                rows = conn.execute(
+                    """
+                    SELECT id, run_id, business_name, maps_url, phone, email, website, address, stage, channel_preferred, opt_out
+                    FROM leads
+                    WHERE stage IN ('NEW', 'QUALIFIED')
+                      AND opt_out = 0
+                      AND channel_preferred IN ('EMAIL', 'WHATSAPP')
+                      AND run_id LIKE ?
+                    ORDER BY CASE WHEN channel_preferred='EMAIL' THEN 0 ELSE 1 END, id ASC LIMIT ?
+                    """,
+                    (f"{run_id_prefix}%", limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, run_id, business_name, maps_url, phone, email, website, address, stage, channel_preferred, opt_out
+                    FROM leads
+                    WHERE stage IN ('NEW', 'QUALIFIED') AND opt_out = 0 AND channel_preferred IN ('EMAIL', 'WHATSAPP')
+                    ORDER BY CASE WHEN channel_preferred='EMAIL' THEN 0 ELSE 1 END, id ASC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
         return [Lead(*self._normalize_lead_row(row)) for row in rows]
 
     def list_leads_for_offer(self, limit: int = 100) -> list[Lead]:
