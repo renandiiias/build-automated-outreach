@@ -415,6 +415,9 @@ def render_dashboard_html() -> str:
     safe_class = "bad" if ops["global_safe_mode"] else "ok"
     baseline_txt = f"{pricing['baseline_conversion'] * 100:.1f}%" if pricing["baseline_conversion"] is not None else "n/a"
     conv_txt = f"{funnel['conversion_7d'] * 100:.1f}%"
+    lead_total_geo = max(1, sum(int(it["leads"]) for it in geo["by_country"]))
+    max_channel_touches = max([int(it["touches"]) for it in geo["approaches_by_channel"]] or [1])
+    max_country_channel_touches = max([int(it["touches"]) for it in geo["approaches_by_country_channel"]] or [1])
 
     stage_funnel = [
         ("Leads 7d", funnel["leads_7d"]),
@@ -440,13 +443,24 @@ def render_dashboard_html() -> str:
         f"<tr><td>{c['channel']}</td><td>{c['status']}</td><td>{c['reason'] or '-'}</td></tr>" for c in ops["channels"]
     ) or "<tr><td colspan='3'>Sem canais registrados.</td></tr>"
     country_rows = "".join(
-        f"<tr><td>{it['country']}</td><td>{it['leads']}</td></tr>" for it in geo["by_country"]
+        (
+            f"<tr><td><b>{it['country']}</b></td><td>{it['leads']}</td>"
+            f"<td><div class='meter'><i style='width:{max(4, int((int(it['leads']) / lead_total_geo) * 100))}%'></i></div></td></tr>"
+        )
+        for it in geo["by_country"]
     ) or "<tr><td colspan='2'>Sem dados por pais.</td></tr>"
     approach_channel_rows = "".join(
-        f"<tr><td>{it['channel']}</td><td>{it['touches']}</td></tr>" for it in geo["approaches_by_channel"]
+        (
+            f"<tr><td><b>{it['channel']}</b></td><td>{it['touches']}</td>"
+            f"<td><div class='meter'><i style='width:{max(4, int((int(it['touches']) / max_channel_touches) * 100))}%'></i></div></td></tr>"
+        )
+        for it in geo["approaches_by_channel"]
     ) or "<tr><td colspan='2'>Sem abordagens registradas.</td></tr>"
     approach_country_channel_rows = "".join(
-        f"<tr><td>{it['country']}</td><td>{it['channel']}</td><td>{it['touches']}</td></tr>"
+        (
+            f"<tr><td>{it['country']}</td><td>{it['channel']}</td><td>{it['touches']}</td>"
+            f"<td><div class='meter'><i style='width:{max(4, int((int(it['touches']) / max_country_channel_touches) * 100))}%'></i></div></td></tr>"
+        )
         for it in geo["approaches_by_country_channel"][:20]
     ) or "<tr><td colspan='3'>Sem cruzamento pais/canal.</td></tr>"
 
@@ -468,35 +482,51 @@ def render_dashboard_html() -> str:
   <title>LeadGenerator - Painel Comercial</title>
   <style>
     :root {{
-      --bg0:#f2f6f9;
-      --bg1:#e8f2ff;
+      --bg0:#f7fafc;
+      --bg1:#e7eef7;
       --card:#ffffff;
-      --ink:#0f172a;
-      --muted:#475569;
-      --line:#dbe3ee;
+      --ink:#111827;
+      --muted:#4b5563;
+      --line:#e5e7eb;
       --ok:#15803d;
       --warn:#c2410c;
       --bad:#b91c1c;
       --brand:#0f766e;
-      --brand2:#1d4ed8;
+      --brand2:#0369a1;
+      --accent:#1d4ed8;
+      --shadow:0 8px 24px rgba(2, 6, 23, 0.07);
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       font-family: "Avenir Next", "Segoe UI", sans-serif;
       color: var(--ink);
-      background: radial-gradient(1200px 500px at 90% -10%, #cbe7ff 0%, transparent 65%), linear-gradient(180deg, var(--bg1), var(--bg0));
+      background:
+        radial-gradient(1000px 400px at 100% -10%, rgba(3, 105, 161, .16) 0%, transparent 70%),
+        radial-gradient(900px 300px at -10% -10%, rgba(15, 118, 110, .18) 0%, transparent 75%),
+        linear-gradient(180deg, var(--bg1), var(--bg0));
     }}
-    .wrap {{ max-width: 1220px; margin: 0 auto; padding: 16px 16px 28px; }}
+    .wrap {{ max-width: 1280px; margin: 0 auto; padding: 18px 18px 30px; }}
     .hero {{
-      border: 1px solid var(--line);
-      background: linear-gradient(135deg, #f8fbff 0%, #edf7ff 45%, #eefaf4 100%);
-      border-radius: 14px;
-      padding: 14px 16px;
-      margin-bottom: 12px;
+      border: 1px solid #dbe3ee;
+      background: linear-gradient(135deg, #ffffff 0%, #f0f7ff 45%, #ecfdf5 100%);
+      border-radius: 16px;
+      padding: 16px 18px;
+      margin-bottom: 14px;
+      box-shadow: var(--shadow);
     }}
-    .hero h1 {{ margin: 0; font-size: 22px; letter-spacing: 0.2px; }}
+    .hero h1 {{ margin: 0; font-size: 24px; letter-spacing: 0.2px; }}
     .hero p {{ margin: 4px 0 0; color: var(--muted); font-size: 13px; }}
+    .hero-top {{ display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }}
+    .badge {{
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+    }}
     .grid {{ display: grid; gap: 10px; }}
     .kpis {{ grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }}
     .split {{ grid-template-columns: 1.6fr 1fr; }}
@@ -504,12 +534,12 @@ def render_dashboard_html() -> str:
     .card {{
       background: var(--card);
       border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 12px;
-      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: var(--shadow);
     }}
     .kpi-title {{ font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.6px; }}
-    .kpi-value {{ font-size: 28px; font-weight: 700; margin-top: 2px; }}
+    .kpi-value {{ font-size: 30px; font-weight: 750; margin-top: 2px; line-height: 1.05; }}
     .ok {{ color: var(--ok); }} .bad {{ color: var(--bad); }} .warn {{ color: var(--warn); }}
     .price-row {{ display:flex; gap:10px; margin-top:6px; }}
     .pill {{
@@ -521,33 +551,52 @@ def render_dashboard_html() -> str:
       background: #f8fafc;
     }}
     .progress {{
-      width: 100%; height: 10px; border-radius: 999px; background: #e2e8f0; overflow: hidden; margin-top: 8px;
+      width: 100%; height: 11px; border-radius: 999px; background: #e5e7eb; overflow: hidden; margin-top: 8px;
     }}
     .progress > i {{
       display:block; height: 100%; width: {progress_pct}%;
-      background: linear-gradient(90deg, var(--brand), var(--brand2));
+      background: linear-gradient(90deg, var(--brand), var(--accent), var(--brand2));
     }}
-    h2 {{ margin: 0 0 8px; font-size: 15px; }}
+    h2 {{ margin: 0 0 8px; font-size: 16px; }}
     .funnel {{ display:grid; gap:7px; }}
     .funnel-item {{
       display:flex; justify-content:space-between; align-items:center;
-      border:1px solid var(--line); border-radius:9px; padding:8px 10px;
-      background: #fbfdff;
+      border:1px solid var(--line); border-radius:10px; padding:9px 11px;
+      background: linear-gradient(180deg, #ffffff, #f8fafc);
     }}
     table {{ width:100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ border-bottom:1px solid var(--line); text-align:left; padding:6px; vertical-align:top; }}
+    th, td {{ border-bottom:1px solid var(--line); text-align:left; padding:7px 6px; vertical-align:top; }}
+    th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }}
     code {{ white-space: pre-wrap; word-break: break-word; color:#0f172a; font-family: "SFMono-Regular", Menlo, monospace; }}
     .muted {{ color: var(--muted); font-size: 12px; }}
+    .meter {{
+      width: 100%;
+      height: 8px;
+      background: #e5e7eb;
+      border-radius: 999px;
+      overflow: hidden;
+      min-width: 120px;
+    }}
+    .meter > i {{
+      display:block;
+      height:100%;
+      background: linear-gradient(90deg, var(--brand), var(--accent));
+    }}
+    .compact {{ max-height: 420px; overflow: auto; }}
     @media (max-width: 940px) {{
       .split, .triple {{ grid-template-columns: 1fr; }}
+      .kpi-value {{ font-size: 24px; }}
     }}
   </style>
 </head>
 <body>
 <div class='wrap'>
   <section class='hero'>
-    <h1>Painel Comercial LeadGenerator</h1>
-    <p>Atualizado em {snap['generated_at_utc']} (UTC). Status: <b class='{safe_class}'>{safe_mode}</b>.</p>
+    <div class='hero-top'>
+      <h1>Painel Comercial LeadGenerator</h1>
+      <span class='badge'>Atualizacao automatica: 10s</span>
+    </div>
+    <p>Atualizado em {snap['generated_at_utc']} (UTC). Status global: <b class='{safe_class}'>{safe_mode}</b>.</p>
   </section>
 
   <section class='grid kpis'>
@@ -607,14 +656,14 @@ def render_dashboard_html() -> str:
     <div class='card'>
       <h2>Leads por Pais</h2>
       <table>
-        <thead><tr><th>Pais</th><th>Leads</th></tr></thead>
+        <thead><tr><th>Pais</th><th>Leads</th><th>Participacao</th></tr></thead>
         <tbody>{country_rows}</tbody>
       </table>
     </div>
     <div class='card'>
       <h2>Abordagens por Canal</h2>
       <table>
-        <thead><tr><th>Canal</th><th>Total de abordagens</th></tr></thead>
+        <thead><tr><th>Canal</th><th>Total de abordagens</th><th>Volume relativo</th></tr></thead>
         <tbody>{approach_channel_rows}</tbody>
       </table>
     </div>
@@ -622,8 +671,8 @@ def render_dashboard_html() -> str:
 
   <section class='card' style='margin-top:10px'>
     <h2>Abordagens por Pais x Canal</h2>
-    <table>
-      <thead><tr><th>Pais</th><th>Canal</th><th>Abordagens</th></tr></thead>
+    <table class='compact'>
+      <thead><tr><th>Pais</th><th>Canal</th><th>Abordagens</th><th>Forca</th></tr></thead>
       <tbody>{approach_country_channel_rows}</tbody>
     </table>
   </section>
