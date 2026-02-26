@@ -147,25 +147,22 @@ class LeadPipelineRunner:
             if enrich_website:
                 rows = enrich_with_website_contacts(rows, self.logger, run_id)
 
-            rows_qualified = [row for row in rows if not str(row.get("website", "")).strip()]
-            relaxed = False
-            if not rows_qualified and self.allow_relaxed_icp:
-                # Fallback pragmatica: se zero sem-site, permite leads com telefone/email para nao travar a run.
-                rows_qualified = [
-                    row
-                    for row in rows
-                    if str(row.get("phone", "")).strip() or str(row.get("website_emails", "")).strip()
-                ]
-                relaxed = True
-                self.logger.write(
-                    "icp_relaxed_mode_enabled",
-                    {
-                        "run_id": run_id,
-                        "reason": "no_website_leads_found",
-                        "strict_candidates": 0,
-                        "relaxed_candidates": len(rows_qualified),
-                    },
-                )
+            # International mode: keep all contactable businesses, including those with existing websites.
+            rows_qualified = [
+                row
+                for row in rows
+                if str(row.get("phone", "")).strip() or str(row.get("website_emails", "")).strip()
+            ]
+            relaxed = True
+            self.logger.write(
+                "icp_relaxed_mode_enabled",
+                {
+                    "run_id": run_id,
+                    "reason": "contactable_businesses_only",
+                    "strict_candidates": 0,
+                    "relaxed_candidates": len(rows_qualified),
+                },
+            )
 
             leads_before = self.store.count_leads()
             for row in rows_qualified:
@@ -291,6 +288,7 @@ class LeadPipelineRunner:
                     unsub,
                     variant=variant,
                     city=lead.address,
+                    has_website=bool((lead.website or "").strip()),
                 )
                 sent = self.email_client.send(lead.email, subject, html)
                 self.store.save_touch(lead.id, "EMAIL", "CONSENT_REQUEST", f"email_v{variant}", sent.status, sent.message_id, body_text)
@@ -330,7 +328,10 @@ class LeadPipelineRunner:
                 if not normalized:
                     self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "invalid_phone"})
                     continue
-                msg = initial_consent_whatsapp(lead.business_name)
+                msg = initial_consent_whatsapp(
+                    lead.business_name,
+                    has_website=bool((lead.website or "").strip()),
+                )
                 sent = self.wa_client.send(normalized, msg)
                 self.store.save_touch(lead.id, "WHATSAPP", "CONSENT_REQUEST", "wa_v1", sent.status, sent.message_id, msg)
                 self.ops.add_channel_metrics("WHATSAPP", sent=1, failed=0 if sent.ok else 1)
@@ -374,7 +375,12 @@ class LeadPipelineRunner:
 
             if lead.channel_preferred == "EMAIL" and lead.email and self.email_client and not self.ops.is_channel_paused("EMAIL"):
                 unsub = build_unsubscribe_url(self.unsubscribe_base, lead.id, "EMAIL")
-                subject, body_text, html = followup_consent_email(lead.business_name, unsub, step=step)
+                subject, body_text, html = followup_consent_email(
+                    lead.business_name,
+                    unsub,
+                    step=step,
+                    has_website=bool((lead.website or "").strip()),
+                )
                 sent = self.email_client.send(lead.email, subject, html)
                 self.store.save_touch(lead.id, "EMAIL", "CONSENT_REQUEST", f"email_followup_{step}", sent.status, sent.message_id, body_text)
                 self.ops.add_channel_metrics("EMAIL", sent=1, failed=0 if sent.ok else 1)
@@ -386,7 +392,11 @@ class LeadPipelineRunner:
                 normalized = normalize_phone_br(lead.phone)
                 if not normalized:
                     continue
-                body = followup_consent_whatsapp(lead.business_name, step=step)
+                body = followup_consent_whatsapp(
+                    lead.business_name,
+                    step=step,
+                    has_website=bool((lead.website or "").strip()),
+                )
                 sent = self.wa_client.send(normalized, body)
                 self.store.save_touch(lead.id, "WHATSAPP", "CONSENT_REQUEST", f"wa_followup_{step}", sent.status, sent.message_id, body)
                 self.ops.add_channel_metrics("WHATSAPP", sent=1, failed=0 if sent.ok else 1)
@@ -413,7 +423,12 @@ class LeadPipelineRunner:
             if next_step == 0:
                 continue
             unsub = build_unsubscribe_url(self.unsubscribe_base, lead.id, "EMAIL")
-            subject, body_text, html = offer_followup_email(lead.business_name, unsub, step=next_step)
+            subject, body_text, html = offer_followup_email(
+                lead.business_name,
+                unsub,
+                step=next_step,
+                has_website=bool((lead.website or "").strip()),
+            )
             sent = self.email_client.send(lead.email, subject, html)
             self.store.save_touch(lead.id, "EMAIL", "OFFER", f"email_offer_followup_{next_step}", sent.status, sent.message_id, body_text)
             self.ops.add_channel_metrics("EMAIL", sent=1, failed=0 if sent.ok else 1)
@@ -526,6 +541,7 @@ class LeadPipelineRunner:
                     demo.preview_url,
                     payment_url,
                     unsub,
+                    has_website=bool((lead.website or "").strip()),
                     price_full=pricing.price_full,
                     price_simple=pricing.price_simple,
                     payment_url_full=payment_url_full,
@@ -580,7 +596,15 @@ class LeadPipelineRunner:
                     break
                 phone = normalize_phone_br(lead.phone)
                 if phone:
-                    body = offer_whatsapp(lead.business_name, demo.preview_url, payment_url)
+                    pricing = self.store.get_pricing_state()
+                    body = offer_whatsapp(
+                        lead.business_name,
+                        demo.preview_url,
+                        payment_url,
+                        has_website=bool((lead.website or "").strip()),
+                        price_full=pricing.price_full,
+                        price_simple=pricing.price_simple,
+                    )
                     result = self.wa_client.send(phone, body)
                     self.store.save_touch(lead.id, "WHATSAPP", "OFFER", "wa_offer_v1", result.status, result.message_id, body)
                     self.ops.add_channel_metrics("WHATSAPP", sent=1, failed=0 if result.ok else 1)

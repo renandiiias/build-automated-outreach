@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -8,6 +9,25 @@ from pathlib import Path
 from typing import Any
 
 from .time_utils import UTC
+
+
+def _price_base_full() -> int:
+    return int(os.getenv("LEADGEN_PRICE_BASE_FULL", "200") or "200")
+
+
+def _price_base_simple() -> int:
+    return int(os.getenv("LEADGEN_PRICE_BASE_SIMPLE", "100") or "100")
+
+
+def _price_step() -> int:
+    return int(os.getenv("LEADGEN_PRICE_STEP", "100") or "100")
+
+
+def _price_for_level(level: int) -> tuple[int, int]:
+    base_full = _price_base_full()
+    base_simple = _price_base_simple()
+    step = _price_step()
+    return base_full + (level * step), base_simple + (level * step)
 
 
 @dataclass
@@ -502,18 +522,19 @@ class CrmStore:
                 updated_at_utc=str(row[6]),
             )
         now = self._now().isoformat()
+        base_full, base_simple = _price_for_level(0)
         conn.execute(
             """
             INSERT INTO pricing_state (id, price_level, price_full, price_simple, baseline_conversion, offers_in_window, sales_in_window, updated_at_utc)
-            VALUES (1, 0, 200, 100, NULL, 0, 0, ?)
+            VALUES (1, 0, ?, ?, NULL, 0, 0, ?)
             """,
-            (now,),
+            (base_full, base_simple, now),
         )
         conn.commit()
         return PricingState(
             price_level=0,
-            price_full=200,
-            price_simple=100,
+            price_full=base_full,
+            price_simple=base_simple,
             baseline_conversion=None,
             offers_in_window=0,
             sales_in_window=0,
@@ -591,8 +612,7 @@ class CrmStore:
                         }
                     )
                     level = new_level
-                    price_full = 200 + (new_level * 100)
-                    price_simple = 100 + (new_level * 100)
+                    price_full, price_simple = _price_for_level(new_level)
 
                 offers = 0
                 sales = 0
@@ -660,8 +680,7 @@ class CrmStore:
             )
 
             new_level = state.price_level + 1
-            new_full = 200 + (new_level * 100)
-            new_simple = 100 + (new_level * 100)
+            new_full, new_simple = _price_for_level(new_level)
             conn.execute(
                 """
                 INSERT INTO pricing_events (event_type, from_level, to_level, reason, run_id, timestamp_utc)
