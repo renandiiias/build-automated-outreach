@@ -156,6 +156,22 @@ class CrmStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS contact_send_guard (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contact_hash TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    intent TEXT NOT NULL,
+                    first_lead_id INTEGER NOT NULL,
+                    last_lead_id INTEGER NOT NULL,
+                    first_sent_at_utc TEXT NOT NULL,
+                    last_sent_at_utc TEXT NOT NULL,
+                    send_count INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(contact_hash, channel, intent)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS pricing_state (
                     id INTEGER PRIMARY KEY,
                     price_level INTEGER NOT NULL,
@@ -510,6 +526,37 @@ class CrmStore:
                 (contact_hash, channel),
             ).fetchone()
         return row is not None
+
+    @staticmethod
+    def _contact_hash(contact: str) -> str:
+        return hashlib.sha256((contact or "").strip().lower().encode("utf-8")).hexdigest()
+
+    def has_contact_been_sent(self, contact: str, channel: str, intent: str) -> bool:
+        h = self._contact_hash(contact)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM contact_send_guard WHERE contact_hash=? AND channel=? AND intent=? LIMIT 1",
+                (h, channel, intent),
+            ).fetchone()
+        return row is not None
+
+    def mark_contact_sent(self, contact: str, channel: str, intent: str, lead_id: int) -> None:
+        ts = self._now().isoformat()
+        h = self._contact_hash(contact)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO contact_send_guard
+                (contact_hash, channel, intent, first_lead_id, last_lead_id, first_sent_at_utc, last_sent_at_utc, send_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(contact_hash, channel, intent) DO UPDATE SET
+                    last_lead_id=excluded.last_lead_id,
+                    last_sent_at_utc=excluded.last_sent_at_utc,
+                    send_count=contact_send_guard.send_count + 1
+                """,
+                (h, channel, intent, lead_id, lead_id, ts, ts),
+            )
+            conn.commit()
 
     def get_pricing_state(self) -> PricingState:
         with self._connect() as conn:

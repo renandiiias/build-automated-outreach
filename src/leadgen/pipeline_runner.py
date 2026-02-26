@@ -279,6 +279,13 @@ class LeadPipelineRunner:
 
                 if self.store.is_opted_out(lead.email, "EMAIL"):
                     continue
+                email_contact = (lead.email or "").strip().lower()
+                if self.store.has_contact_been_sent(email_contact, "EMAIL", "CONSENT_REQUEST"):
+                    self.logger.write(
+                        "lead_skipped",
+                        {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "duplicate_contact_guard"},
+                    )
+                    continue
                 if not self.email_client:
                     self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "client_not_configured"})
                     continue
@@ -300,6 +307,7 @@ class LeadPipelineRunner:
                 count += 1
                 if sent.ok:
                     self.store.update_stage(lead.id, "WAITING_REPLY")
+                    self.store.mark_contact_sent(email_contact, "EMAIL", "CONSENT_REQUEST", lead.id)
                     self.logger.write("contact_delivered", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "daily_sent": email_metrics.sent})
                 else:
                     self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "detail": sent.detail})
@@ -331,6 +339,12 @@ class LeadPipelineRunner:
                 if not normalized:
                     self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "invalid_phone"})
                     continue
+                if self.store.has_contact_been_sent(normalized, "WHATSAPP", "CONSENT_REQUEST"):
+                    self.logger.write(
+                        "lead_skipped",
+                        {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "duplicate_contact_guard"},
+                    )
+                    continue
                 msg = initial_consent_whatsapp(
                     lead.business_name,
                     has_website=bool((lead.website or "").strip()),
@@ -343,6 +357,7 @@ class LeadPipelineRunner:
                 count += 1
                 if sent.ok:
                     self.store.update_stage(lead.id, "WAITING_REPLY")
+                    self.store.mark_contact_sent(normalized, "WHATSAPP", "CONSENT_REQUEST", lead.id)
                     self.logger.write("contact_delivered", {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP"})
                 else:
                     self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "detail": sent.detail})
