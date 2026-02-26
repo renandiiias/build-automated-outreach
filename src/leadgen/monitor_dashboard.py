@@ -43,6 +43,70 @@ def _db_counts(db_path: Path) -> dict[str, Any]:
     }
 
 
+def _derive_country(phone: str, address: str) -> str:
+    phone_s = (phone or "").strip()
+    address_l = (address or "").lower()
+    if phone_s.startswith("+55") or "brasil" in address_l or "brazil" in address_l:
+        return "BR"
+    if phone_s.startswith("+44") or "london" in address_l or "united kingdom" in address_l or "uk" in address_l:
+        return "UK"
+    if not phone_s and not address_l:
+        return "UNKNOWN"
+    return "OTHER"
+
+
+def _country_channel_snapshot(db_path: Path) -> dict[str, Any]:
+    defaults = {"by_country": [], "approaches_by_channel": [], "approaches_by_country_channel": []}
+    if not db_path.exists():
+        return defaults
+    try:
+        with sqlite3.connect(db_path) as conn:
+            lead_rows = conn.execute("SELECT phone, address FROM leads").fetchall()
+            by_country_counter: Counter[str] = Counter()
+            for row in lead_rows:
+                by_country_counter[_derive_country(str(row[0] or ""), str(row[1] or ""))] += 1
+
+            channel_rows = conn.execute(
+                """
+                SELECT channel, COUNT(*)
+                FROM touches
+                GROUP BY channel
+                ORDER BY COUNT(*) DESC
+                """
+            ).fetchall()
+
+            country_channel_rows = conn.execute(
+                """
+                SELECT l.phone, l.address, t.channel, COUNT(*)
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                GROUP BY l.phone, l.address, t.channel
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return defaults
+
+    country_channel_counter: Counter[tuple[str, str]] = Counter()
+    for phone, address, channel, count in country_channel_rows:
+        country = _derive_country(str(phone or ""), str(address or ""))
+        country_channel_counter[(country, str(channel or "UNKNOWN"))] += int(count or 0)
+
+    return {
+        "by_country": [
+            {"country": country, "leads": count}
+            for country, count in sorted(by_country_counter.items(), key=lambda it: (-it[1], it[0]))
+        ],
+        "approaches_by_channel": [
+            {"channel": str(r[0] or "UNKNOWN"), "touches": int(r[1])}
+            for r in channel_rows
+        ],
+        "approaches_by_country_channel": [
+            {"country": country, "channel": channel, "touches": touches}
+            for (country, channel), touches in sorted(country_channel_counter.items(), key=lambda it: (-it[1], it[0][0], it[0][1]))
+        ],
+    }
+
+
 def _ops_snapshot(ops_db: Path) -> dict[str, Any]:
     if not ops_db.exists():
         return {"global_safe_mode": False, "channels": [], "metrics": []}
@@ -293,6 +357,7 @@ def build_snapshot() -> dict[str, Any]:
         "ops": _ops_snapshot(cfg.ops_state_db),
         "pricing": _pricing_snapshot(cfg.state_db),
         "funnel_7d": _funnel_7d(cfg.state_db),
+        "geo_channels": _country_channel_snapshot(cfg.state_db),
         "domain_ops": _domain_ops_snapshot(cfg.state_db),
         "reply_queue": _reply_queue_snapshot(cfg.state_db),
         "events_summary": _compute_event_summary(events),
@@ -343,6 +408,7 @@ def render_dashboard_html() -> str:
     queue = snap["reply_queue"]
     domains = snap["domain_ops"]
     ops = snap["ops"]
+    geo = snap["geo_channels"]
     es = snap["events_summary"]
     progress_pct = min(100, int((pricing["offers_in_window"] / 10) * 100))
     safe_mode = "ATIVO" if ops["global_safe_mode"] else "DESATIVADO"
@@ -373,6 +439,16 @@ def render_dashboard_html() -> str:
     channel_rows = "".join(
         f"<tr><td>{c['channel']}</td><td>{c['status']}</td><td>{c['reason'] or '-'}</td></tr>" for c in ops["channels"]
     ) or "<tr><td colspan='3'>Sem canais registrados.</td></tr>"
+    country_rows = "".join(
+        f"<tr><td>{it['country']}</td><td>{it['leads']}</td></tr>" for it in geo["by_country"]
+    ) or "<tr><td colspan='2'>Sem dados por pais.</td></tr>"
+    approach_channel_rows = "".join(
+        f"<tr><td>{it['channel']}</td><td>{it['touches']}</td></tr>" for it in geo["approaches_by_channel"]
+    ) or "<tr><td colspan='2'>Sem abordagens registradas.</td></tr>"
+    approach_country_channel_rows = "".join(
+        f"<tr><td>{it['country']}</td><td>{it['channel']}</td><td>{it['touches']}</td></tr>"
+        for it in geo["approaches_by_country_channel"][:20]
+    ) or "<tr><td colspan='3'>Sem cruzamento pais/canal.</td></tr>"
 
     event_rows = ""
     for e in reversed(snap["events"][-18:]):
@@ -525,6 +601,31 @@ def render_dashboard_html() -> str:
         Entregues: {es['contact_delivered']} | Falhas: {es['contact_failed']} | Ofertas enviadas: {es['offer_sent']}
       </div>
     </div>
+  </section>
+
+  <section class='grid split' style='margin-top:10px'>
+    <div class='card'>
+      <h2>Leads por Pais</h2>
+      <table>
+        <thead><tr><th>Pais</th><th>Leads</th></tr></thead>
+        <tbody>{country_rows}</tbody>
+      </table>
+    </div>
+    <div class='card'>
+      <h2>Abordagens por Canal</h2>
+      <table>
+        <thead><tr><th>Canal</th><th>Total de abordagens</th></tr></thead>
+        <tbody>{approach_channel_rows}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class='card' style='margin-top:10px'>
+    <h2>Abordagens por Pais x Canal</h2>
+    <table>
+      <thead><tr><th>Pais</th><th>Canal</th><th>Abordagens</th></tr></thead>
+      <tbody>{approach_country_channel_rows}</tbody>
+    </table>
   </section>
 
   <section class='grid triple' style='margin-top:10px'>
