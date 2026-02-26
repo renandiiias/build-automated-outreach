@@ -301,7 +301,7 @@ class CrmStore:
                 SELECT id, run_id, business_name, maps_url, phone, email, website, address, stage, channel_preferred, opt_out
                 FROM leads
                 WHERE stage IN ('NEW', 'QUALIFIED') AND opt_out = 0 AND channel_preferred IN ('EMAIL', 'WHATSAPP')
-                ORDER BY id ASC LIMIT ?
+                ORDER BY CASE WHEN channel_preferred='EMAIL' THEN 0 ELSE 1 END, id ASC LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
