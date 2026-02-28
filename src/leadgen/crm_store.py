@@ -45,6 +45,20 @@ class Lead:
     opt_out: int
 
 
+def _infer_country_code(phone: str, address: str) -> str:
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    addr = (address or "").lower()
+    if digits.startswith("55") or any(token in addr for token in [" brasil", "brazil", " sao paulo", " rio de janeiro", " belo horizonte", " fortaleza", " recife"]):
+        return "BR"
+    if digits.startswith("351") or any(token in addr for token in [" portugal", " lisboa", " lisbon", " porto"]):
+        return "PT"
+    if digits.startswith("44") or any(token in addr for token in [" united kingdom", " london", " manchester", " england"]):
+        return "UK"
+    if digits.startswith("1") or any(token in addr for token in [" united states", " usa", " miami", " new york", " florida"]):
+        return "US"
+    return ""
+
+
 @dataclass
 class PricingState:
     price_level: int
@@ -100,6 +114,8 @@ class CrmStore:
                     address TEXT NOT NULL,
                     stage TEXT NOT NULL,
                     channel_preferred TEXT NOT NULL,
+                    audience TEXT NOT NULL DEFAULT '',
+                    country_code TEXT NOT NULL DEFAULT '',
                     opt_out INTEGER NOT NULL DEFAULT 0,
                     consent_accepted INTEGER NOT NULL DEFAULT 0,
                     preview_url TEXT NOT NULL DEFAULT '',
@@ -263,12 +279,23 @@ class CrmStore:
             ("accepted_plan", "ALTER TABLE leads ADD COLUMN accepted_plan TEXT NOT NULL DEFAULT ''"),
             ("won_at_utc", "ALTER TABLE leads ADD COLUMN won_at_utc TEXT NOT NULL DEFAULT ''"),
             ("lost_at_utc", "ALTER TABLE leads ADD COLUMN lost_at_utc TEXT NOT NULL DEFAULT ''"),
+            ("audience", "ALTER TABLE leads ADD COLUMN audience TEXT NOT NULL DEFAULT ''"),
+            ("country_code", "ALTER TABLE leads ADD COLUMN country_code TEXT NOT NULL DEFAULT ''"),
         ]
         for col, sql in migrations:
             if col not in lead_cols:
                 conn.execute(sql)
+        if "country_code" in {str(r[1]) for r in conn.execute("PRAGMA table_info(leads)").fetchall()}:
+            rows = conn.execute("SELECT id, phone, address, country_code FROM leads").fetchall()
+            for row in rows:
+                existing = str(row[3] or "").strip().upper()
+                if existing:
+                    continue
+                guessed = _infer_country_code(str(row[1] or ""), str(row[2] or ""))
+                if guessed:
+                    conn.execute("UPDATE leads SET country_code=? WHERE id=?", (guessed, int(row[0])))
 
-    def upsert_lead_from_row(self, run_id: str, row: dict[str, Any]) -> int:
+    def upsert_lead_from_row(self, run_id: str, row: dict[str, Any], audience: str = "", country_code: str = "") -> int:
         now = self._now().isoformat()
         name = str(row.get("name", "")).strip()
         phone = str(row.get("phone", "")).strip()
@@ -276,6 +303,8 @@ class CrmStore:
         website = str(row.get("website", "")).strip()
         maps_url = str(row.get("maps_url", "")).strip()
         address = str(row.get("address", "")).strip()
+        normalized_audience = str(audience or "").strip()
+        normalized_country = str(country_code or "").strip().upper() or _infer_country_code(phone, address)
 
         preferred = "EMAIL" if email else ("WHATSAPP" if phone else "NONE")
         stage = "NEW"
@@ -285,8 +314,8 @@ class CrmStore:
                 """
                 INSERT INTO leads (
                     run_id, business_name, maps_url, phone, email, website, address,
-                    stage, channel_preferred, created_at_utc, updated_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stage, channel_preferred, audience, country_code, created_at_utc, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(maps_url) DO UPDATE SET
                     run_id=excluded.run_id,
                     business_name=excluded.business_name,
@@ -295,9 +324,25 @@ class CrmStore:
                     website=excluded.website,
                     address=excluded.address,
                     channel_preferred=excluded.channel_preferred,
+                    audience=CASE WHEN excluded.audience != '' THEN excluded.audience ELSE leads.audience END,
+                    country_code=CASE WHEN excluded.country_code != '' THEN excluded.country_code ELSE leads.country_code END,
                     updated_at_utc=excluded.updated_at_utc
                 """,
-                (run_id, name, maps_url, phone, email, website, address, stage, preferred, now, now),
+                (
+                    run_id,
+                    name,
+                    maps_url,
+                    phone,
+                    email,
+                    website,
+                    address,
+                    stage,
+                    preferred,
+                    normalized_audience,
+                    normalized_country,
+                    now,
+                    now,
+                ),
             )
             row_db = conn.execute("SELECT id FROM leads WHERE maps_url = ?", (maps_url,)).fetchone()
             conn.commit()

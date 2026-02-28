@@ -166,8 +166,9 @@ class LeadPipelineRunner:
             )
 
             leads_before = self.store.count_leads()
+            country_code = self._country_code_for_location(location)
             for row in rows_qualified:
-                lead_id = self.store.upsert_lead_from_row(run_id, row)
+                lead_id = self.store.upsert_lead_from_row(run_id, row, audience=audience, country_code=country_code)
                 self.store.update_stage(lead_id, "QUALIFIED")
                 self.logger.write(
                     "lead_qualified",
@@ -793,6 +794,19 @@ class LeadPipelineRunner:
         if re.search(r"\b(sp|rj|mg|ba|ce|pr|rs|sc|go|df)\b", addr):
             return "pt-BR"
         return "en"
+
+    @staticmethod
+    def _country_code_for_location(location: str) -> str:
+        lowered = (location or "").lower()
+        if any(token in lowered for token in ["brazil", "brasil", "sao paulo", "rio de janeiro", "belo horizonte", "fortaleza", "recife", "salvador"]):
+            return "BR"
+        if any(token in lowered for token in ["portugal", "lisbon", "lisboa", "porto"]):
+            return "PT"
+        if any(token in lowered for token in ["united kingdom", "london", "manchester", "england"]):
+            return "UK"
+        if any(token in lowered for token in ["united states", "usa", "new york", "miami", "florida"]):
+            return "US"
+        return ""
 
     @staticmethod
     def _regional_prices(locale: str, pricing) -> tuple[int, int, str]:

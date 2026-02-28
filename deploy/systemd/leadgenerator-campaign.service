@@ -1,0 +1,15 @@
+[Unit]
+Description=LeadGenerator Campaign Runner (continuous)
+After=network.target leadgenerator-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/leadgenerator
+EnvironmentFile=/opt/leadgenerator/.env
+ExecStart=/opt/leadgenerator/.venv/bin/python /opt/leadgenerator/scripts/run_campaign_window.py --audience "hotel" --location "Sao Paulo, Brazil" --fallback-locations "Rio de Janeiro, Brazil,Lisbon, Portugal,Porto, Portugal,London, United Kingdom,Manchester, United Kingdom,Miami, Florida, United States,New York, New York, United States" --minutes 30 --max-results 6 --cycle-sleep-min 60 --cycle-sleep-max 95 --force-resume-scrape --location-switch-streak 1 --ingest-timeout-seconds 180 --outreach-timeout-seconds 180 --enrich-website
+Restart=always
+RestartSec=8
+User=root
+
+[Install]
+WantedBy=multi-user.target

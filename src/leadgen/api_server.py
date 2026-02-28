@@ -26,14 +26,17 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        country = ((query.get("country") or ["ALL"])[0] or "ALL").strip().upper()
+        audience = ((query.get("audience") or ["ALL"])[0] or "ALL").strip()
         if parsed.path == "/health":
             self._send_json(200, {"status": "ok"})
             return
         if parsed.path == "/api/status":
-            self._send_json(200, build_snapshot())
+            self._send_json(200, build_snapshot(country_filter=country, audience_filter=audience))
             return
         if parsed.path in {"/dashboard", "/"}:
-            self._send_html(200, render_dashboard_html())
+            self._send_html(200, render_dashboard_html(country_filter=country, audience_filter=audience))
             return
         if parsed.path == "/api/pricing/state":
             st = self.store.get_pricing_state()

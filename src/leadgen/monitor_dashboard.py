@@ -7,8 +7,10 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus, unquote_plus
 
 from .config import get_config
+from .crm_store import CrmStore
 
 
 def _parse_utc(value: str) -> datetime | None:
@@ -24,6 +26,37 @@ def _parse_utc(value: str) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _normalize_country_filter(value: str) -> str:
+    raw = (value or "ALL").strip().upper()
+    return raw if raw in {"ALL", "BR", "NON_BR", "PT", "UK", "US"} else "ALL"
+
+
+def _normalize_audience_filter(value: str) -> str:
+    raw = (value or "ALL").strip()
+    if not raw:
+        return "ALL"
+    if raw.lower() == "all":
+        return "ALL"
+    return raw[:120]
+
+
+def _lead_filter_clauses(country_filter: str = "ALL", audience_filter: str = "ALL", alias: str = "") -> tuple[list[str], list[Any]]:
+    prefix = f"{alias}." if alias else ""
+    clauses: list[str] = []
+    params: list[Any] = []
+    country = _normalize_country_filter(country_filter)
+    audience = _normalize_audience_filter(audience_filter)
+    if country == "NON_BR":
+        clauses.append(f"COALESCE({prefix}country_code, '') != 'BR'")
+    elif country != "ALL":
+        clauses.append(f"COALESCE({prefix}country_code, '') = ?")
+        params.append(country)
+    if audience != "ALL":
+        clauses.append(f"lower(COALESCE({prefix}audience, '')) = lower(?)")
+        params.append(audience)
+    return clauses, params
 
 
 def _read_last_events(path: Path, max_lines: int = 200) -> list[dict[str, Any]]:
@@ -42,14 +75,30 @@ def _read_last_events(path: Path, max_lines: int = 200) -> list[dict[str, Any]]:
     return out
 
 
-def _db_counts(db_path: Path) -> dict[str, Any]:
+def _db_counts(db_path: Path, country_filter: str = "ALL", audience_filter: str = "ALL") -> dict[str, Any]:
     if not db_path.exists():
         return {"leads_total": 0, "stage_counts": {}, "touches_total": 0, "replies_total": 0}
     with sqlite3.connect(db_path) as conn:
-        leads_total = int(conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0])
-        rows = conn.execute("SELECT stage, COUNT(*) FROM leads GROUP BY stage").fetchall()
-        touches_total = int(conn.execute("SELECT COUNT(*) FROM touches").fetchone()[0])
-        replies_total = int(conn.execute("SELECT COUNT(*) FROM replies").fetchone()[0])
+        clauses, params = _lead_filter_clauses(country_filter, audience_filter)
+        where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        leads_total = int(conn.execute(f"SELECT COUNT(*) FROM leads{where_sql}", params).fetchone()[0])
+        rows = conn.execute(f"SELECT stage, COUNT(*) FROM leads{where_sql} GROUP BY stage", params).fetchall()
+        if clauses:
+            touches_total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM touches t JOIN leads l ON l.id = t.lead_id WHERE {' AND '.join(_lead_filter_clauses(country_filter, audience_filter, 'l')[0])}",
+                    _lead_filter_clauses(country_filter, audience_filter, "l")[1],
+                ).fetchone()[0]
+            )
+            replies_total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM replies r JOIN leads l ON l.id = r.lead_id WHERE {' AND '.join(_lead_filter_clauses(country_filter, audience_filter, 'l')[0])}",
+                    _lead_filter_clauses(country_filter, audience_filter, "l")[1],
+                ).fetchone()[0]
+            )
+        else:
+            touches_total = int(conn.execute("SELECT COUNT(*) FROM touches").fetchone()[0])
+            replies_total = int(conn.execute("SELECT COUNT(*) FROM replies").fetchone()[0])
     return {
         "leads_total": leads_total,
         "stage_counts": {str(r[0]): int(r[1]) for r in rows},
@@ -58,52 +107,70 @@ def _db_counts(db_path: Path) -> dict[str, Any]:
     }
 
 
-def _derive_country(phone: str, address: str) -> str:
+def _derive_country(phone: str, address: str, country_code: str = "") -> str:
+    normalized = (country_code or "").strip().upper()
+    if normalized in {"BR", "PT", "UK", "US"}:
+        return normalized
+    if normalized == "NON_BR":
+        return "OTHER"
     phone_s = (phone or "").strip()
     address_l = (address or "").lower()
     if phone_s.startswith("+55") or "brasil" in address_l or "brazil" in address_l:
         return "BR"
+    if phone_s.startswith("+351") or "portugal" in address_l or "lisbon" in address_l or "lisboa" in address_l or "porto" in address_l:
+        return "PT"
     if phone_s.startswith("+44") or "london" in address_l or "united kingdom" in address_l or "uk" in address_l:
         return "UK"
+    if phone_s.startswith("+1") or "united states" in address_l or "usa" in address_l or "new york" in address_l or "miami" in address_l:
+        return "US"
     if not phone_s and not address_l:
         return "UNKNOWN"
     return "OTHER"
 
 
-def _country_channel_snapshot(db_path: Path) -> dict[str, Any]:
+def _country_channel_snapshot(db_path: Path, country_filter: str = "ALL", audience_filter: str = "ALL") -> dict[str, Any]:
     defaults = {"by_country": [], "approaches_by_channel": [], "approaches_by_country_channel": []}
     if not db_path.exists():
         return defaults
     try:
         with sqlite3.connect(db_path) as conn:
-            lead_rows = conn.execute("SELECT phone, address FROM leads").fetchall()
+            lead_clauses, lead_params = _lead_filter_clauses(country_filter, audience_filter)
+            lead_where = f" WHERE {' AND '.join(lead_clauses)}" if lead_clauses else ""
+            lead_rows = conn.execute(f"SELECT phone, address, country_code FROM leads{lead_where}", lead_params).fetchall()
             by_country_counter: Counter[str] = Counter()
             for row in lead_rows:
-                by_country_counter[_derive_country(str(row[0] or ""), str(row[1] or ""))] += 1
+                by_country_counter[_derive_country(str(row[0] or ""), str(row[1] or ""), str(row[2] or ""))] += 1
 
+            touch_clauses, touch_params = _lead_filter_clauses(country_filter, audience_filter, "l")
+            touch_where = f" WHERE {' AND '.join(touch_clauses)}" if touch_clauses else ""
             channel_rows = conn.execute(
-                """
+                f"""
                 SELECT channel, COUNT(*)
-                FROM touches
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                {touch_where}
                 GROUP BY channel
                 ORDER BY COUNT(*) DESC
-                """
+                """,
+                touch_params,
             ).fetchall()
 
             country_channel_rows = conn.execute(
-                """
-                SELECT l.phone, l.address, t.channel, COUNT(*)
+                f"""
+                SELECT l.country_code, l.phone, l.address, t.channel, COUNT(*)
                 FROM touches t
                 JOIN leads l ON l.id = t.lead_id
-                GROUP BY l.phone, l.address, t.channel
-                """
+                {touch_where}
+                GROUP BY l.country_code, l.phone, l.address, t.channel
+                """,
+                touch_params,
             ).fetchall()
     except sqlite3.Error:
         return defaults
 
     country_channel_counter: Counter[tuple[str, str]] = Counter()
-    for phone, address, channel, count in country_channel_rows:
-        country = _derive_country(str(phone or ""), str(address or ""))
+    for country_code, phone, address, channel, count in country_channel_rows:
+        country = _derive_country(str(phone or ""), str(address or ""), str(country_code or ""))
         country_channel_counter[(country, str(channel or "UNKNOWN"))] += int(count or 0)
 
     return {
@@ -122,7 +189,39 @@ def _country_channel_snapshot(db_path: Path) -> dict[str, Any]:
     }
 
 
-def _throughput_snapshot(db_path: Path, events: list[dict[str, Any]]) -> dict[str, Any]:
+def _audience_options_snapshot(db_path: Path, country_filter: str = "ALL") -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+    try:
+        with sqlite3.connect(db_path) as conn:
+            clauses, params = _lead_filter_clauses(country_filter, "ALL")
+            if clauses:
+                clauses.append("trim(COALESCE(audience, '')) != ''")
+                sql = f" WHERE {' AND '.join(clauses)}"
+            else:
+                sql = " WHERE trim(COALESCE(audience, '')) != ''"
+            rows = conn.execute(
+                f"""
+                SELECT trim(audience) AS audience_value, COUNT(*)
+                FROM leads
+                {sql}
+                GROUP BY lower(trim(audience))
+                ORDER BY COUNT(*) DESC, lower(trim(audience)) ASC
+                LIMIT 12
+                """,
+                params,
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [{"audience": str(r[0] or "").strip(), "count": int(r[1])} for r in rows if str(r[0] or "").strip()]
+
+
+def _throughput_snapshot(
+    db_path: Path,
+    events: list[dict[str, Any]],
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+) -> dict[str, Any]:
     defaults = {
         "touches_1h_total": 0,
         "touches_24h_total": 0,
@@ -153,34 +252,49 @@ def _throughput_snapshot(db_path: Path, events: list[dict[str, Any]]) -> dict[st
     since_24h = (now - timedelta(hours=24)).isoformat()
     try:
         with sqlite3.connect(db_path) as conn:
+            lead_clauses, lead_params = _lead_filter_clauses(country_filter, audience_filter, "l")
+            base_1h = [*lead_clauses, "t.timestamp_utc >= ?"]
+            base_24h = [*lead_clauses, "t.timestamp_utc >= ?"]
+            lead_self_clauses, lead_self_params = _lead_filter_clauses(country_filter, audience_filter)
             rows_1h = conn.execute(
-                """
+                f"""
                 SELECT channel, COUNT(*)
-                FROM touches
-                WHERE timestamp_utc >= ?
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                WHERE {' AND '.join(base_1h)}
                 GROUP BY channel
                 ORDER BY COUNT(*) DESC
                 """,
-                (since_1h,),
+                [*lead_params, since_1h],
             ).fetchall()
             rows_24h = conn.execute(
-                """
+                f"""
                 SELECT channel, COUNT(*)
-                FROM touches
-                WHERE timestamp_utc >= ?
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                WHERE {' AND '.join(base_24h)}
                 GROUP BY channel
                 ORDER BY COUNT(*) DESC
                 """,
-                (since_24h,),
+                [*lead_params, since_24h],
             ).fetchall()
             new_leads_24h = int(
-                conn.execute("SELECT COUNT(*) FROM leads WHERE created_at_utc >= ?", (since_24h,)).fetchone()[0]
+                conn.execute(
+                    f"SELECT COUNT(*) FROM leads WHERE {' AND '.join([*lead_self_clauses, 'created_at_utc >= ?'])}",
+                    [*lead_self_params, since_24h],
+                ).fetchone()[0]
             )
             replies_24h = int(
-                conn.execute("SELECT COUNT(*) FROM replies WHERE timestamp_utc >= ?", (since_24h,)).fetchone()[0]
+                conn.execute(
+                    f"SELECT COUNT(*) FROM replies r JOIN leads l ON l.id = r.lead_id WHERE {' AND '.join([*lead_clauses, 'r.timestamp_utc >= ?'])}",
+                    [*lead_params, since_24h],
+                ).fetchone()[0]
             )
             offers_24h = int(
-                conn.execute("SELECT COUNT(*) FROM offer_snapshots WHERE offered_at_utc >= ?", (since_24h,)).fetchone()[0]
+                conn.execute(
+                    f"SELECT COUNT(*) FROM offer_snapshots o JOIN leads l ON l.id = o.lead_id WHERE {' AND '.join([*lead_clauses, 'o.offered_at_utc >= ?'])}",
+                    [*lead_params, since_24h],
+                ).fetchone()[0]
             )
     except sqlite3.Error:
         defaults["last_event_utc"] = last_event_utc
@@ -275,7 +389,7 @@ def _pricing_snapshot(db_path: Path) -> dict[str, Any]:
     }
 
 
-def _funnel_7d(db_path: Path) -> dict[str, Any]:
+def _funnel_7d(db_path: Path, country_filter: str = "ALL", audience_filter: str = "ALL") -> dict[str, Any]:
     defaults = {
         "leads_7d": 0,
         "consented_7d": 0,
@@ -291,31 +405,54 @@ def _funnel_7d(db_path: Path) -> dict[str, Any]:
     since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     try:
         with sqlite3.connect(db_path) as conn:
-            leads_7d = int(conn.execute("SELECT COUNT(*) FROM leads WHERE created_at_utc >= ?", (since,)).fetchone()[0])
+            clauses, params = _lead_filter_clauses(country_filter, audience_filter)
+            leads_7d_where = " AND ".join([*clauses, "created_at_utc >= ?"])
+            consented_where = " AND ".join([*clauses, "consent_accepted=1", "updated_at_utc >= ?"])
+            won_where = " AND ".join([*clauses, "stage='WON'", "updated_at_utc >= ?"])
+            lost_where = " AND ".join([*clauses, "stage='LOST'", "updated_at_utc >= ?"])
+            won_time_where = " AND ".join([*clauses, "stage='WON'", "won_at_utc != ''", "won_at_utc >= ?"])
+            leads_7d = int(conn.execute(f"SELECT COUNT(*) FROM leads WHERE {leads_7d_where}", [*params, since]).fetchone()[0])
             consented_7d = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM leads WHERE consent_accepted=1 AND updated_at_utc >= ?",
-                    (since,),
+                    f"SELECT COUNT(*) FROM leads WHERE {consented_where}",
+                    [*params, since],
                 ).fetchone()[0]
             )
-            offers_7d = int(conn.execute("SELECT COUNT(*) FROM offer_snapshots WHERE offered_at_utc >= ?", (since,)).fetchone()[0])
-            won_7d = int(conn.execute("SELECT COUNT(*) FROM leads WHERE stage='WON' AND updated_at_utc >= ?", (since,)).fetchone()[0])
-            lost_7d = int(conn.execute("SELECT COUNT(*) FROM leads WHERE stage='LOST' AND updated_at_utc >= ?", (since,)).fetchone()[0])
+            lead_clauses_alias, lead_params_alias = _lead_filter_clauses(country_filter, audience_filter, "l")
+            lead_where_alias = " AND ".join([*lead_clauses_alias, "o.offered_at_utc >= ?"])
+            offers_7d = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM offer_snapshots o JOIN leads l ON l.id = o.lead_id WHERE {lead_where_alias}",
+                    [*lead_params_alias, since],
+                ).fetchone()[0]
+            )
+            won_7d = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM leads WHERE {won_where}",
+                    [*params, since],
+                ).fetchone()[0]
+            )
+            lost_7d = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM leads WHERE {lost_where}",
+                    [*params, since],
+                ).fetchone()[0]
+            )
             avg_days_row = conn.execute(
-                """
+                f"""
                 SELECT AVG(julianday(won_at_utc) - julianday(created_at_utc))
                 FROM leads
-                WHERE stage='WON' AND won_at_utc != '' AND won_at_utc >= ?
+                WHERE {won_time_where}
                 """,
-                (since,),
+                [*params, since],
             ).fetchone()
             revenue_row = conn.execute(
-                """
+                f"""
                 SELECT COALESCE(SUM(sale_amount), 0)
                 FROM leads
-                WHERE stage='WON' AND won_at_utc != '' AND won_at_utc >= ?
+                WHERE {won_time_where}
                 """,
-                (since,),
+                [*params, since],
             ).fetchone()
     except sqlite3.Error:
         return defaults
@@ -443,17 +580,25 @@ def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build_snapshot() -> dict[str, Any]:
+def build_snapshot(country_filter: str = "ALL", audience_filter: str = "ALL") -> dict[str, Any]:
     cfg = get_config()
+    CrmStore(cfg.state_db)
     events = _read_last_events(cfg.log_dir / "events.jsonl")
+    country = _normalize_country_filter(country_filter)
+    audience = _normalize_audience_filter(audience_filter)
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "db": _db_counts(cfg.state_db),
+        "db": _db_counts(cfg.state_db, country, audience),
         "ops": _ops_snapshot(cfg.ops_state_db),
         "pricing": _pricing_snapshot(cfg.state_db),
-        "funnel_7d": _funnel_7d(cfg.state_db),
-        "geo_channels": _country_channel_snapshot(cfg.state_db),
-        "throughput": _throughput_snapshot(cfg.state_db, events),
+        "funnel_7d": _funnel_7d(cfg.state_db, country, audience),
+        "geo_channels": _country_channel_snapshot(cfg.state_db, country, audience),
+        "throughput": _throughput_snapshot(cfg.state_db, events, country, audience),
+        "filters": {
+            "country": country,
+            "audience": audience,
+            "audience_options": _audience_options_snapshot(cfg.state_db, country),
+        },
         "domain_ops": _domain_ops_snapshot(cfg.state_db),
         "reply_queue": _reply_queue_snapshot(cfg.state_db),
         "events_summary": _compute_event_summary(events),
@@ -463,14 +608,24 @@ def build_snapshot() -> dict[str, Any]:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.startswith("/api/status"):
-            self._json(200, build_snapshot())
+        path, _, query_raw = self.path.partition("?")
+        query: dict[str, str] = {}
+        if query_raw:
+            for part in query_raw.split("&"):
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                query[k] = unquote_plus(v)
+        country = query.get("country", "ALL")
+        audience = query.get("audience", "ALL")
+        if path.startswith("/api/status"):
+            self._json(200, build_snapshot(country_filter=country, audience_filter=audience))
             return
-        if self.path.startswith("/health"):
+        if path.startswith("/health"):
             self._json(200, {"status": "ok"})
             return
-        if self.path == "/" or self.path.startswith("/?"):
-            self._html(200, self._render_dashboard())
+        if path == "/":
+            self._html(200, self._render_dashboard(country_filter=country, audience_filter=audience))
             return
         self._json(404, {"ok": False, "error": "not_found"})
 
@@ -493,12 +648,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _render_dashboard(self) -> str:
-        return render_dashboard_html()
+    def _render_dashboard(self, country_filter: str = "ALL", audience_filter: str = "ALL") -> str:
+        return render_dashboard_html(country_filter=country_filter, audience_filter=audience_filter)
 
 
-def render_dashboard_html() -> str:
-    snap = build_snapshot()
+def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "ALL") -> str:
+    snap = build_snapshot(country_filter=country_filter, audience_filter=audience_filter)
     pricing = snap["pricing"]
     funnel = snap["funnel_7d"]
     queue = snap["reply_queue"]
@@ -506,6 +661,7 @@ def render_dashboard_html() -> str:
     ops = snap["ops"]
     geo = snap["geo_channels"]
     throughput = snap["throughput"]
+    filters = snap["filters"]
     es = snap["events_summary"]
     progress_pct = min(100, int((pricing["offers_in_window"] / 10) * 100))
     safe_mode = "ATIVO" if ops["global_safe_mode"] else "DESATIVADO"
@@ -536,6 +692,17 @@ def render_dashboard_html() -> str:
     pace_channels = sorted(set(ch_1h.keys()) | set(ch_24h.keys()))
     pace_max_1h = max(1, max([ch_1h.get(ch, 0) for ch in pace_channels] or [0]))
     pace_max_24h = max(1, max([ch_24h.get(ch, 0) for ch in pace_channels] or [0]))
+    selected_country = filters["country"]
+    selected_audience = filters["audience"]
+    current_scope = {
+        "ALL": "Geral",
+        "BR": "Brasil",
+        "NON_BR": "Fora do Brasil",
+        "PT": "Portugal",
+        "UK": "Reino Unido",
+        "US": "USA",
+    }.get(selected_country, "Geral")
+    scope_suffix = "" if selected_audience == "ALL" else f" | Nicho: {selected_audience}"
 
     stage_funnel = [
         ("Leads 7d", funnel["leads_7d"]),
@@ -589,6 +756,33 @@ def render_dashboard_html() -> str:
         )
         for ch in pace_channels
     ) or "<tr><td colspan='5'>Sem ritmo por canal ainda.</td></tr>"
+    country_choices = [
+        ("ALL", "Geral"),
+        ("BR", "Brasil"),
+        ("NON_BR", "Fora do BR"),
+        ("PT", "Portugal"),
+        ("UK", "Reino Unido"),
+        ("US", "USA"),
+    ]
+    country_pills = "".join(
+        (
+            f"<a class='filter-pill {'is-active' if selected_country == value else ''}' "
+            f"href='/dashboard?country={quote_plus(value)}&audience={quote_plus(selected_audience)}'>{label}</a>"
+        )
+        for value, label in country_choices
+    )
+    audience_pills = (
+        f"<a class='filter-pill {'is-active' if selected_audience == 'ALL' else ''}' "
+        f"href='/dashboard?country={quote_plus(selected_country)}&audience=ALL'>Todos os nichos</a>"
+    )
+    audience_pills += "".join(
+        (
+            f"<a class='filter-pill {'is-active' if selected_audience == item['audience'] else ''}' "
+            f"href='/dashboard?country={quote_plus(selected_country)}&audience={quote_plus(item['audience'])}'>"
+            f"{item['audience']} <span>{item['count']}</span></a>"
+        )
+        for item in filters["audience_options"]
+    )
 
     event_rows = ""
     for e in reversed(snap["events"][-18:]):
@@ -658,6 +852,35 @@ def render_dashboard_html() -> str:
       font-weight: 700;
       background: #eff6ff;
       border-color: #bfdbfe;
+    }}
+    .filters {{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      margin-top:10px;
+    }}
+    .filter-pill {{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      text-decoration:none;
+      border-radius:999px;
+      padding:7px 12px;
+      border:1px solid var(--line);
+      background:#ffffff;
+      color:var(--muted);
+      font-size:12px;
+      font-weight:600;
+      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+    }}
+    .filter-pill span {{
+      color: var(--accent);
+      font-weight: 700;
+    }}
+    .filter-pill.is-active {{
+      background: linear-gradient(135deg, #eff6ff, #ecfdf5);
+      border-color: #bfdbfe;
+      color: #0f172a;
     }}
     .grid {{ display: grid; gap: 10px; }}
     .kpis {{ grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }}
@@ -731,7 +954,7 @@ def render_dashboard_html() -> str:
       <h1>Painel Comercial LeadGenerator</h1>
       <span class='badge'>Atualizacao automatica: 10s</span>
     </div>
-    <p>Atualizado em {snap['generated_at_utc']} (UTC). Status global: <b class='{safe_class}'>{safe_mode}</b>.</p>
+    <p>Atualizado em {snap['generated_at_utc']} (UTC). Status global: <b class='{safe_class}'>{safe_mode}</b>. Escopo: <b>{current_scope}</b>{scope_suffix}.</p>
     <div class='hero-top' style='margin-top:8px'>
       <span class='badge badge-activity'>Ultima atividade: <b class='{activity_class}'>{activity_txt}</b></span>
       <span class='badge'>Abordagens 1h: <b>{throughput['touches_1h_total']}</b></span>
@@ -739,6 +962,8 @@ def render_dashboard_html() -> str:
       <span class='badge'>Leads novos 24h: <b>{throughput['new_leads_24h']}</b></span>
       <span class='badge'>Respostas 24h: <b>{throughput['replies_24h']}</b></span>
     </div>
+    <div class='filters'>{country_pills}</div>
+    <div class='filters'>{audience_pills}</div>
   </section>
 
   <section class='grid kpis'>
