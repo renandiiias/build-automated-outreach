@@ -534,8 +534,8 @@ def render_dashboard_html() -> str:
     ch_1h = {str(it["channel"]): int(it["count"]) for it in throughput["touches_1h_by_channel"]}
     ch_24h = {str(it["channel"]): int(it["count"]) for it in throughput["touches_24h_by_channel"]}
     pace_channels = sorted(set(ch_1h.keys()) | set(ch_24h.keys()))
-    pace_max_1h = max([ch_1h.get(ch, 0) for ch in pace_channels] or [1])
-    pace_max_24h = max([ch_24h.get(ch, 0) for ch in pace_channels] or [1])
+    pace_max_1h = max(1, max([ch_1h.get(ch, 0) for ch in pace_channels] or [0]))
+    pace_max_24h = max(1, max([ch_24h.get(ch, 0) for ch in pace_channels] or [0]))
 
     stage_funnel = [
         ("Leads 7d", funnel["leads_7d"]),
