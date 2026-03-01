@@ -103,7 +103,18 @@ def build_audience_variants(audience: str, country_code: str = "") -> list[str]:
     base = (audience or "").strip()
     lowered = base.lower()
     cc = (country_code or "").strip().upper()
-    variants: list[str] = [base]
+    generic_markers = {
+        "service providers",
+        "service provider",
+        "prestadores de servico",
+        "prestadores de serviço",
+        "prestador de servico",
+        "prestador de serviço",
+        "local services",
+    }
+    variants: list[str] = []
+    if lowered not in generic_markers:
+        variants.append(base)
 
     # 10 nichos de maior probabilidade de resposta via e-mail, por país/idioma.
     country_niches: dict[str, list[str]] = {
