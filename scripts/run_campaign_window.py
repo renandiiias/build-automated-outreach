@@ -5,6 +5,7 @@ import argparse
 import os
 import random
 import re
+import sqlite3
 import signal
 import subprocess
 import sys
@@ -118,6 +119,71 @@ def build_audience_variants(audience: str) -> list[str]:
     return dedup or [base]
 
 
+def _country_code_for_location(location: str) -> str:
+    lowered = (location or "").lower()
+    if any(token in lowered for token in ["brazil", "brasil", "sao paulo", "rio de janeiro", "belo horizonte", "fortaleza", "recife", "salvador"]):
+        return "BR"
+    if any(token in lowered for token in ["portugal", "lisbon", "lisboa", "porto", "portimao", "portimão"]):
+        return "PT"
+    if any(token in lowered for token in ["united kingdom", "london", "manchester", "england"]):
+        return "UK"
+    if any(token in lowered for token in ["spain", "españa", "espana", "madrid", "barcelona", "valencia", "sevilla"]):
+        return "ES"
+    if any(token in lowered for token in ["united states", "usa", "new york", "miami", "florida"]):
+        return "US"
+    return "OTHER"
+
+
+def _build_country_locations(locations: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    order: list[str] = []
+    by_country: dict[str, list[str]] = {}
+    for loc in locations:
+        cc = _country_code_for_location(loc)
+        if cc == "OTHER":
+            continue
+        if cc not in by_country:
+            by_country[cc] = []
+            order.append(cc)
+        by_country[cc].append(loc)
+    return order, by_country
+
+
+def _fetch_identity_touch_counts(db_path: Path, countries: list[str]) -> dict[str, int]:
+    counts = {cc: 0 for cc in countries}
+    if not countries or not db_path.exists():
+        return counts
+    placeholders = ",".join(["?"] * len(countries))
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT COALESCE(l.country_code, ''), COUNT(*)
+            FROM touches t
+            JOIN leads l ON l.id = t.lead_id
+            WHERE t.intent='IDENTITY_CHECK'
+              AND l.country_code IN ({placeholders})
+            GROUP BY l.country_code
+            """,
+            countries,
+        ).fetchall()
+    for row in rows:
+        cc = str(row[0] or "")
+        if cc in counts:
+            counts[cc] = int(row[1] or 0)
+    return counts
+
+
+def _pick_country_for_block(countries: list[str], counts: dict[str, int], block_size: int) -> str:
+    if not countries:
+        return ""
+    floors = {cc: counts.get(cc, 0) // max(1, block_size) for cc in countries}
+    min_floor = min(floors.values())
+    threshold = (min_floor + 1) * max(1, block_size)
+    for cc in countries:
+        if counts.get(cc, 0) < threshold:
+            return cc
+    return countries[0]
+
+
 class _StepTimeoutError(TimeoutError):
     pass
 
@@ -217,14 +283,26 @@ def main() -> int:
     if not args.disable_audience_variants:
         audience_variants = build_audience_variants(args.audience)
     locations = [args.location] + [x.strip() for x in args.fallback_locations.split(",") if x.strip()]
-    location_idx = 0
-    no_ingest_streak = 0
+    countries_order, locations_by_country = _build_country_locations(locations)
+    block_size = int(os.getenv("LEADGEN_COUNTRY_ROTATION_BLOCK", "20") or "20")
+    location_idx_by_country = {cc: 0 for cc in countries_order}
+    no_ingest_streak_by_country: dict[str, int] = {cc: 0 for cc in countries_order}
 
     while datetime.now(timezone.utc) < deadline:
         cycle += 1
         cycle_id = f"{run_id}-c{cycle:03d}"
         audience_now = audience_variants[(cycle - 1) % len(audience_variants)]
-        location_now = locations[location_idx]
+        counts_by_country = _fetch_identity_touch_counts(runner.cfg.state_db, countries_order)
+        selected_country = _pick_country_for_block(countries_order, counts_by_country, block_size)
+        if selected_country and locations_by_country.get(selected_country):
+            locs = locations_by_country[selected_country]
+            loc_idx = location_idx_by_country.get(selected_country, 0) % len(locs)
+            location_now = locs[loc_idx]
+        else:
+            selected_country = _country_code_for_location(args.location)
+            location_now = args.location
+        country_count = counts_by_country.get(selected_country, 0)
+        in_block = country_count % max(1, block_size)
         runner.logger.write(
             "campaign_cycle_started",
             {
@@ -233,6 +311,9 @@ def main() -> int:
                 "cycle": cycle,
                 "audience_variant": audience_now,
                 "location_variant": location_now,
+                "country_selected": selected_country,
+                "country_identity_touches": country_count,
+                "country_block_progress": f"{in_block}/{block_size}",
             },
         )
         runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "ingest"})
@@ -331,25 +412,34 @@ def main() -> int:
                 "followups_sent": followups,
                 "offers_sent": offers,
                 "deadline_utc": deadline.isoformat(),
+                "country_selected": selected_country,
+                "country_identity_touches": country_count,
+                "country_block_progress": f"{in_block}/{block_size}",
             },
         )
-        if ingested <= 0:
-            no_ingest_streak += 1
-            if no_ingest_streak >= max(1, args.location_switch_streak) and location_idx < (len(locations) - 1):
-                prev = locations[location_idx]
-                location_idx += 1
-                no_ingest_streak = 0
+        if selected_country and ingested <= 0:
+            no_ingest_streak_by_country[selected_country] = no_ingest_streak_by_country.get(selected_country, 0) + 1
+            if (
+                no_ingest_streak_by_country[selected_country] >= max(1, args.location_switch_streak)
+                and len(locations_by_country.get(selected_country, [])) > 1
+            ):
+                prev = location_now
+                location_idx_by_country[selected_country] = location_idx_by_country.get(selected_country, 0) + 1
+                next_loc = locations_by_country[selected_country][location_idx_by_country[selected_country] % len(locations_by_country[selected_country])]
+                no_ingest_streak_by_country[selected_country] = 0
                 runner.logger.write(
                     "campaign_location_switched",
                     {
                         "run_id": run_id,
+                        "country": selected_country,
                         "from_location": prev,
-                        "to_location": locations[location_idx],
+                        "to_location": next_loc,
                         "reason": "no_ingestion_streak",
                     },
                 )
         else:
-            no_ingest_streak = 0
+            if selected_country:
+                no_ingest_streak_by_country[selected_country] = 0
         now = datetime.now(timezone.utc)
         if now >= deadline:
             break
