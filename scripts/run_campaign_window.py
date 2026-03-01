@@ -385,14 +385,46 @@ def main() -> int:
     locations = [args.location] + fallback_locations
     countries_order, locations_by_country = _build_country_locations(locations)
     block_size = int(os.getenv("LEADGEN_COUNTRY_ROTATION_BLOCK", "20") or "20")
+    stall_cycles_threshold = int(os.getenv("LEADGEN_COUNTRY_STALL_CYCLES", "3") or "3")
     location_idx_by_country = {cc: 0 for cc in countries_order}
     no_ingest_streak_by_country: dict[str, int] = {cc: 0 for cc in countries_order}
+    last_touch_count_by_country: dict[str, int] = {}
+    stalled_cycles_by_country: dict[str, int] = {cc: 0 for cc in countries_order}
 
     while datetime.now(timezone.utc) < deadline:
         cycle += 1
         cycle_id = f"{run_id}-c{cycle:03d}"
         counts_by_country = _fetch_identity_touch_counts(runner.cfg.state_db, countries_order)
+        for cc in countries_order:
+            now_count = counts_by_country.get(cc, 0)
+            prev_count = last_touch_count_by_country.get(cc)
+            if prev_count is None or now_count > prev_count:
+                stalled_cycles_by_country[cc] = 0
+            else:
+                stalled_cycles_by_country[cc] = stalled_cycles_by_country.get(cc, 0) + 1
+            last_touch_count_by_country[cc] = now_count
         selected_country = _pick_country_for_block(countries_order, counts_by_country, block_size)
+        if (
+            selected_country
+            and selected_country in countries_order
+            and stalled_cycles_by_country.get(selected_country, 0) >= max(1, stall_cycles_threshold)
+            and len(countries_order) > 1
+        ):
+            curr_idx = countries_order.index(selected_country)
+            forced = countries_order[(curr_idx + 1) % len(countries_order)]
+            runner.logger.write(
+                "campaign_country_forced_advance",
+                {
+                    "run_id": run_id,
+                    "cycle_id": cycle_id,
+                    "from_country": selected_country,
+                    "to_country": forced,
+                    "reason": "stalled_identity_touches",
+                    "stalled_cycles": stalled_cycles_by_country.get(selected_country, 0),
+                    "threshold": stall_cycles_threshold,
+                },
+            )
+            selected_country = forced
         if selected_country and locations_by_country.get(selected_country):
             locs = locations_by_country[selected_country]
             loc_idx = location_idx_by_country.get(selected_country, 0) % len(locs)
