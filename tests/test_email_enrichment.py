@@ -7,11 +7,22 @@ from unittest.mock import patch
 
 from leadgen.contact_sources import ContactCandidate
 from leadgen.crm_store import CrmStore
-from leadgen.email_validation import validate_email
+from leadgen.email_validation import is_valid_email_candidate, validate_email
 from leadgen.enrichment import enrich_with_website_contacts
 
 
 class EmailValidationTests(unittest.TestCase):
+    def test_rejects_asset_and_placeholder_patterns(self) -> None:
+        bad = [
+            "ajax-loader@2x.gif",
+            "1.-logo-reg@2x.png",
+            "8c4075d5481d476e945486754f783364@sentry.io",
+            "example@domain.com",
+            "%20eduardo.mauricio.adv-63120c@adv.oa.pt",
+        ]
+        for email in bad:
+            self.assertFalse(is_valid_email_candidate(email), email)
+
     def test_mx_cache_hit_after_first_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = CrmStore(Path(tmp) / "pipeline.db")

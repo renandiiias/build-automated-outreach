@@ -27,6 +27,7 @@ def enrich_with_website_contacts(rows: list[dict], logger: JsonlLogger, run_id: 
     external_enabled = os.getenv("LEADGEN_EXTERNAL_ENRICH_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
     external_max = int(os.getenv("LEADGEN_EXTERNAL_ENRICH_MAX_CANDIDATES", "5") or "5")
     external_timeout = int(os.getenv("LEADGEN_EXTERNAL_ENRICH_TIMEOUT_SECONDS", "12") or "12")
+    min_score = float(os.getenv("LEADGEN_EMAIL_MIN_SCORE", "0.70") or "0.70")
     for row in rows:
         website = str(row.get("website", "")).strip()
         all_candidates: list[ContactCandidate] = []
@@ -163,6 +164,19 @@ def enrich_with_website_contacts(rows: list[dict], logger: JsonlLogger, run_id: 
             score = source_base + (0.20 * float(cand.confidence)) + (0.10 if vr.mx_ok else 0.0)
             if domain not in freemail_domains:
                 score += 0.05
+            if score < min_score:
+                logger.write(
+                    "lead_contact_candidate_rejected",
+                    {
+                        "run_id": run_id,
+                        "email": em,
+                        "source_name": cand.source_name,
+                        "validation_status": "low_score",
+                        "score": score,
+                        "min_score": min_score,
+                    },
+                )
+                continue
             scored.append((score, cand))
 
         scored.sort(key=lambda it: it[0], reverse=True)

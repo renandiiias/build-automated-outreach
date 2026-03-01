@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .email_validation import is_valid_email_candidate, normalize_email
 from .time_utils import UTC
 
 
@@ -55,20 +56,7 @@ def _price_for_level(level: int) -> tuple[int, int]:
 
 
 def _is_likely_real_email(value: str) -> bool:
-    email = (value or "").strip().lower()
-    if not email or "@" not in email:
-        return False
-    if any(ch in email for ch in ["/", "\\", "?", "#", " "]):
-        return False
-    local, _, domain = email.partition("@")
-    if not local or not domain or "." not in domain:
-        return False
-    tld = domain.rsplit(".", 1)[-1].lower()
-    if tld in _BAD_EMAIL_TLDS:
-        return False
-    if ".." in email or local.startswith(".") or local.endswith(".") or domain.startswith(".") or domain.endswith("."):
-        return False
-    return True
+    return is_valid_email_candidate(value)
 
 
 def _extract_first_valid_email(raw_value: str) -> str:
@@ -76,7 +64,7 @@ def _extract_first_valid_email(raw_value: str) -> str:
     candidates = [m.group(1).strip().lower() for m in _EMAIL_RX.finditer(raw)]
     for cand in candidates:
         if _is_likely_real_email(cand):
-            return cand
+            return normalize_email(cand)
     return ""
 
 
@@ -347,6 +335,27 @@ class CrmStore:
                     mx_ok INTEGER NOT NULL,
                     checked_at_utc TEXT NOT NULL,
                     ttl_seconds INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_bounce_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    bounce_type TEXT NOT NULL,
+                    timestamp_utc TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS blocked_email_domains (
+                    domain TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL,
+                    blocked_until_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL
                 )
                 """
             )
@@ -675,13 +684,67 @@ class CrmStore:
             )
             conn.commit()
 
+    def register_hard_bounce(self, email: str, bounce_type: str = "hard") -> dict[str, Any]:
+        em = normalize_email(email)
+        if not em or "@" not in em:
+            return {"domain": "", "blocked": False, "count_24h": 0}
+        domain = em.split("@", 1)[-1]
+        now = self._now()
+        now_s = now.isoformat()
+        window_start = (now - timedelta(hours=24)).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO email_bounce_events(email, domain, bounce_type, timestamp_utc) VALUES (?, ?, ?, ?)",
+                (em, domain, bounce_type, now_s),
+            )
+            row = conn.execute(
+                "SELECT COUNT(*) FROM email_bounce_events WHERE domain=? AND timestamp_utc>=?",
+                (domain, window_start),
+            ).fetchone()
+            count_24h = int(row[0] or 0) if row else 0
+            blocked = False
+            if count_24h >= 2:
+                blocked = True
+                until = (now + timedelta(days=7)).isoformat()
+                conn.execute(
+                    """
+                    INSERT INTO blocked_email_domains(domain, reason, blocked_until_utc, updated_at_utc)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(domain) DO UPDATE SET
+                        reason=excluded.reason,
+                        blocked_until_utc=excluded.blocked_until_utc,
+                        updated_at_utc=excluded.updated_at_utc
+                    """,
+                    (domain, "hard_bounce_rate", until, now_s),
+                )
+            conn.commit()
+        return {"domain": domain, "blocked": blocked, "count_24h": count_24h}
+
+    def is_email_domain_blocked(self, email: str) -> bool:
+        em = normalize_email(email)
+        if not em or "@" not in em:
+            return False
+        domain = em.split("@", 1)[-1]
+        now = self._now().isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT blocked_until_utc FROM blocked_email_domains WHERE domain=?",
+                (domain,),
+            ).fetchone()
+        if not row or not row[0]:
+            return False
+        return str(row[0]) > now
+
     def get_lead_id_by_email(self, email: str) -> int | None:
         if not email:
+            return None
+        normalized = normalize_email(email)
+        if not normalized:
             return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT id FROM leads WHERE lower(email)=lower(?) ORDER BY id DESC LIMIT 1",
-                (email.strip(),),
+                (normalized,),
             ).fetchone()
         if not row:
             return None
@@ -689,6 +752,9 @@ class CrmStore:
 
     def get_lead_context_by_email(self, email: str) -> dict[str, Any] | None:
         if not email:
+            return None
+        normalized = normalize_email(email)
+        if not normalized:
             return None
         with self._connect() as conn:
             row = conn.execute(
@@ -698,7 +764,7 @@ class CrmStore:
                 WHERE lower(email)=lower(?)
                 ORDER BY id DESC LIMIT 1
                 """,
-                (email.strip(),),
+                (normalized,),
             ).fetchone()
         if not row:
             return None
@@ -800,7 +866,8 @@ class CrmStore:
 
     def register_opt_out(self, contact: str, channel: str, reason: str) -> None:
         ts = self._now().isoformat()
-        contact_hash = hashlib.sha256(contact.encode("utf-8")).hexdigest()
+        normalized_contact = normalize_email(contact) if channel == "EMAIL" else str(contact or "").strip()
+        contact_hash = hashlib.sha256(normalized_contact.encode("utf-8")).hexdigest()
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO opt_outs (contact_hash, channel, reason, timestamp_utc) VALUES (?, ?, ?, ?)",
@@ -808,12 +875,13 @@ class CrmStore:
             )
             conn.execute(
                 "UPDATE leads SET opt_out=1, stage='UNSUBSCRIBED', updated_at_utc=? WHERE email=? OR phone=?",
-                (ts, contact, contact),
+                (ts, normalized_contact, normalized_contact),
             )
             conn.commit()
 
     def is_opted_out(self, contact: str, channel: str) -> bool:
-        contact_hash = hashlib.sha256(contact.encode("utf-8")).hexdigest()
+        normalized_contact = normalize_email(contact) if channel == "EMAIL" else str(contact or "").strip()
+        contact_hash = hashlib.sha256(normalized_contact.encode("utf-8")).hexdigest()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT 1 FROM opt_outs WHERE contact_hash=? AND channel=?",

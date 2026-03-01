@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import get_config
 from .crm_store import CrmStore
+from .email_validation import normalize_email
 from .logging_utils import JsonlLogger
 from .monitor_dashboard import build_snapshot, render_dashboard_html
 from .outreach import (
@@ -119,6 +120,9 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/webhooks/resend-inbound":
             self._handle_resend_inbound()
             return
+        if parsed.path == "/webhooks/resend-events":
+            self._handle_resend_events()
+            return
         if parsed.path == "/webhooks/stripe":
             self._handle_stripe_webhook()
             return
@@ -169,7 +173,49 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
 
     def _extract_email(self, value: str) -> str:
         m = EMAIL_RE.search(value or "")
-        return str(m.group(1)).strip().lower() if m else ""
+        return normalize_email(str(m.group(1)).strip().lower()) if m else ""
+
+    def _handle_resend_events(self) -> None:
+        payload = self._read_json()
+        event_type = str(payload.get("type") or "").strip().lower()
+        data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
+        to_raw = data.get("to") or payload.get("to") or []
+        email_targets: list[str] = []
+        if isinstance(to_raw, str):
+            email_targets = [self._extract_email(to_raw)]
+        elif isinstance(to_raw, list):
+            email_targets = [self._extract_email(str(x or "")) for x in to_raw]
+        email_targets = [e for e in email_targets if e]
+
+        if event_type in {"email.bounced", "email_bounced", "email.delivery.delayed"}:
+            bounce_type = str(data.get("bounce_type") or data.get("type") or "hard").strip().lower()
+            hard = bounce_type in {"hard", "hard_bounce", "permanent"} or event_type in {"email.bounced", "email_bounced"}
+            for email in email_targets:
+                if hard:
+                    self.store.register_opt_out(email, "EMAIL", "hard_bounce")
+                    block = self.store.register_hard_bounce(email, bounce_type="hard")
+                    self.logger.write(
+                        "deliverability_alert",
+                        {
+                            "channel": "EMAIL",
+                            "email": email,
+                            "event_type": event_type,
+                            "bounce_type": bounce_type,
+                            "domain": block.get("domain", ""),
+                            "domain_bounce_count_24h": block.get("count_24h", 0),
+                            "domain_blocked": bool(block.get("blocked", False)),
+                        },
+                    )
+            self._send_json(200, {"ok": True, "processed": len(email_targets), "event_type": event_type})
+            return
+
+        if event_type in {"email.complained", "email_complained"}:
+            for email in email_targets:
+                self.store.register_opt_out(email, "EMAIL", "complaint")
+            self._send_json(200, {"ok": True, "processed": len(email_targets), "event_type": event_type})
+            return
+
+        self._send_json(200, {"ok": True, "ignored": True, "event_type": event_type})
 
     def _parse_id_path(self, path: str, prefix: str, suffix: str) -> int | None:
         if not path.startswith(prefix) or not path.endswith(suffix):

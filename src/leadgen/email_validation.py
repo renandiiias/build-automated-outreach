@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from urllib.parse import unquote
 from dataclasses import dataclass
 
 
@@ -27,6 +28,30 @@ BAD_TLDS = {
     "mp4",
 }
 
+BLOCKED_DOMAINS = {
+    "sentry.io",
+}
+
+PLACEHOLDER_EMAILS = {
+    "example@domain.com",
+    "example@server.co.uk",
+    "exemplo@gmail.com",
+    "ejemplo@domain.com",
+    "test@example.com",
+}
+
+BLOCKED_LOCAL_TOKENS = {
+    "ajax-loader",
+    "loader",
+    "logo",
+    "banner",
+    "thumbnail",
+    "noreply",
+    "no-reply",
+    "postmaster",
+    "mailer-daemon",
+}
+
 
 @dataclass(frozen=True)
 class EmailValidationResult:
@@ -38,8 +63,22 @@ class EmailValidationResult:
     mx_cache_hit: bool
 
 
+def normalize_email(email: str) -> str:
+    v = unquote(str(email or "")).strip().lower()
+    v = v.replace("mailto:", "").strip()
+    v = v.strip("<>\"'`;, ")
+    v = v.lstrip(".")
+    v = re.sub(r"\s+", "", v)
+    if "%" in v:
+        v = v.replace("%", "")
+    return v
+
+
 def is_valid_email_candidate(email: str) -> bool:
-    v = (email or "").strip().lower()
+    raw_input = str(email or "")
+    if "%" in raw_input or " " in raw_input:
+        return False
+    v = normalize_email(raw_input)
     if not v or "@" not in v:
         return False
     if not EMAIL_RX.match(v):
@@ -48,6 +87,16 @@ def is_valid_email_candidate(email: str) -> bool:
         return False
     local, _, domain = v.partition("@")
     if not local or not domain or "." not in domain:
+        return False
+    if v in PLACEHOLDER_EMAILS:
+        return False
+    if domain in BLOCKED_DOMAINS:
+        return False
+    if any(tok in local for tok in BLOCKED_LOCAL_TOKENS):
+        return False
+    if "@2x" in local:
+        return False
+    if local.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico")):
         return False
     if ".." in v or local.startswith(".") or local.endswith(".") or domain.startswith(".") or domain.endswith("."):
         return False
@@ -71,7 +120,7 @@ def _resolve_mx(domain: str) -> bool:
 
 
 def validate_email(email: str, store=None) -> EmailValidationResult:
-    raw = (email or "").strip().lower()
+    raw = normalize_email(email)
     if not is_valid_email_candidate(raw):
         return EmailValidationResult(
             email=raw,
@@ -115,4 +164,3 @@ def validate_email(email: str, store=None) -> EmailValidationResult:
         reason=status,
         mx_cache_hit=cache_hit,
     )
-
