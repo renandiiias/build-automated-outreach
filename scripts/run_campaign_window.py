@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fallback-locations",
         default="",
-        help="Lista separada por virgula de localidades de fallback (ex: Fortaleza CE,Recife PE)",
+        help="Lista de localidades de fallback. Use '|' entre localidades (ex: Fortaleza CE|Recife PE).",
     )
     parser.add_argument("--minutes", type=int, default=30, help="Duracao da janela da campanha")
     parser.add_argument("--max-results", type=int, default=60, help="Maximo de leads por ingestao")
@@ -218,14 +218,31 @@ def _country_code_for_location(location: str) -> str:
 def _build_country_locations(locations: list[str]) -> tuple[list[str], dict[str, list[str]]]:
     order: list[str] = []
     by_country: dict[str, list[str]] = {}
+    country_only_tokens = {
+        "brazil",
+        "brasil",
+        "portugal",
+        "united kingdom",
+        "england",
+        "spain",
+        "españa",
+        "espana",
+        "united states",
+        "usa",
+    }
     for loc in locations:
+        clean = (loc or "").strip()
+        if not clean:
+            continue
+        if clean.lower() in country_only_tokens:
+            continue
         cc = _country_code_for_location(loc)
         if cc == "OTHER":
             continue
         if cc not in by_country:
             by_country[cc] = []
             order.append(cc)
-        by_country[cc].append(loc)
+        by_country[cc].append(clean)
     return order, by_country
 
 
@@ -360,7 +377,12 @@ def main() -> int:
 
     cycle = 0
     totals = {"ingested": 0, "consent_sent": 0, "followups_sent": 0, "offers_sent": 0}
-    locations = [args.location] + [x.strip() for x in args.fallback_locations.split(",") if x.strip()]
+    fallback_raw = (args.fallback_locations or "").strip()
+    if "|" in fallback_raw:
+        fallback_locations = [x.strip() for x in fallback_raw.split("|") if x.strip()]
+    else:
+        fallback_locations = [x.strip() for x in fallback_raw.split(",") if x.strip()]
+    locations = [args.location] + fallback_locations
     countries_order, locations_by_country = _build_country_locations(locations)
     block_size = int(os.getenv("LEADGEN_COUNTRY_ROTATION_BLOCK", "20") or "20")
     location_idx_by_country = {cc: 0 for cc in countries_order}
