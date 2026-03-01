@@ -11,6 +11,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .geo_normalizer import GeoCityNormalizer
+
 
 @dataclass(frozen=True)
 class DeliveryResult:
@@ -110,6 +112,9 @@ def build_unsubscribe_url(base_url: str, lead_id: int, channel: str) -> str:
     return f"{base_url.rstrip('/')}/unsubscribe?{query}"
 
 
+_GEO_NORMALIZER = GeoCityNormalizer()
+
+
 def _is_pt_br(locale: str) -> bool:
     return (locale or "").strip().lower().startswith("pt")
 
@@ -119,58 +124,8 @@ def _is_spanish(locale: str) -> bool:
 
 
 def _location_hint(value: str, locale: str) -> str:
-    raw = (value or "").strip()
-    if not raw:
-        if _is_pt_br(locale):
-            return "sua cidade"
-        if _is_spanish(locale):
-            return "tu ciudad"
-        return "your city"
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts:
-        return raw
-    country_words = {
-        "brazil", "brasil", "portugal", "united kingdom", "england", "usa", "united states", "spain", "espana", "españa"
-    }
-    filtered = [p for p in parts if p.lower() not in country_words]
-    parts = filtered or parts
-    # Prioriza cidade legível e ignora CEP/ZIP ou trecho de rua.
-    postal_patterns = [
-        re.compile(r"^\d{5}-?\d{3}$"),                 # BR CEP
-        re.compile(r"^\d{5}(?:-\d{4})?$"),             # US ZIP
-        re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$", re.I),  # UK postcode
-    ]
-    street_tokens = {
-        "rua", "av", "avenida", "travessa", "alameda", "rodovia", "estrada",
-        "street", "st", "road", "rd", "avenue", "ave", "blvd", "drive", "dr",
-        "calle", "carrer", "plaza", "piazza",
-    }
-
-    def _score(part: str) -> int:
-        p = (part or "").strip()
-        low = p.lower()
-        letters = len(re.findall(r"[a-zA-ZÀ-ÿ]", p))
-        digits = len(re.findall(r"\d", p))
-        if not p:
-            return -99
-        if any(rx.match(p) for rx in postal_patterns):
-            return -50
-        score = 0
-        if letters > 0:
-            score += 4
-        if digits > 0:
-            score -= 2
-        if digits >= letters and digits > 0:
-            score -= 2
-        if any(tok in low for tok in street_tokens):
-            score -= 2
-        if len(p) <= 2:
-            score -= 2
-        return score
-
-    ranked = sorted(parts, key=lambda p: (_score(p), parts.index(p)), reverse=True)
-    best = ranked[0] if ranked else parts[-1]
-    return best
+    city, _source = _GEO_NORMALIZER.normalize_city((value or "").strip(), locale=locale)
+    return city
 
 
 def _identity_service_label(service_hint: str, locale: str) -> str:
