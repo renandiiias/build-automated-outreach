@@ -33,12 +33,21 @@ run_healthcheck() {
   if [[ -z "$url" ]]; then
     return 0
   fi
-  curl -fsS "$url" >/dev/null
+  local attempts=10
+  local delay_seconds=3
+  local i
+  for ((i = 1; i <= attempts; i++)); do
+    if curl -fsS "$url" >/dev/null; then
+      return 0
+    fi
+    sleep "$delay_seconds"
+  done
+  return 1
 }
 
 rollback() {
   LOG_JSON "rollback" "started" "Rolling back from latest backup"
-  "${SSH_CMD[@]}" "$DO_SSH_TARGET" "set -e; cd '$REMOTE_DIR'; if ls backup-*.tgz >/dev/null 2>&1; then latest=\$(ls -1t backup-*.tgz | head -n1); tar -xzf \"$latest\"; fi; sudo systemctl restart '$SERVICE_NAME'"
+  "${SSH_CMD[@]}" "$DO_SSH_TARGET" "set -e; cd '$REMOTE_DIR'; if ls backup-*.tgz >/dev/null 2>&1; then latest=\$(ls -1t backup-*.tgz | head -n1); tar -xzf \"\$latest\"; fi; sudo systemctl restart '$SERVICE_NAME'"
   LOG_JSON "rollback" "finished" "Rollback completed"
 }
 
