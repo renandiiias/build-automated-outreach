@@ -258,6 +258,7 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
                 locale = self._lead_locale(str(lead_ctx.get("phone") or ""), str(lead_ctx.get("address") or ""))
                 unsubscribe_base = os.getenv("UNSUBSCRIBE_BASE_URL", "https://api.renandias.site")
                 unsub = build_unsubscribe_url(unsubscribe_base, lead_id, "EMAIL")
+                ab_variant = "A" if (lead_id % 2 == 0) else "B"
                 subject, body_text, html_out = initial_consent_email(
                     str(lead_ctx.get("business_name") or ""),
                     unsub,
@@ -265,16 +266,22 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
                     city=str(lead_ctx.get("address") or ""),
                     has_website=bool(str(lead_ctx.get("website") or "").strip()),
                     locale=locale,
+                    service_hint=str(lead_ctx.get("audience") or ""),
+                    ab_variant=ab_variant,
                 )
                 sent = self.email_client.send(from_email, subject, html_out)
                 self.store.save_touch(
                     lead_id,
                     "EMAIL",
                     "CONSENT_REQUEST",
-                    "email_v2_handoff",
+                    f"email_v2_handoff_{ab_variant.lower()}",
                     sent.status,
                     sent.message_id,
                     body_text,
+                )
+                self.logger.write(
+                    "ab_variant_assigned",
+                    {"lead_id": lead_id, "channel": "EMAIL", "template_group": "v2_handoff", "variant": ab_variant},
                 )
                 if sent.ok:
                     self.store.update_stage(lead_id, "WAITING_REPLY")

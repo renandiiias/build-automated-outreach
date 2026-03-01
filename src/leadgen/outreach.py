@@ -176,6 +176,41 @@ def _identity_service_label(service_hint: str, locale: str) -> str:
     return "businesses like yours"
 
 
+def _service_category(service_hint: str) -> str:
+    raw = (service_hint or "").strip().lower()
+    if any(tok in raw for tok in ["electrician", "eletricista", "electricista"]):
+        return "electrician"
+    if any(tok in raw for tok in ["plumber", "encanador", "fontanero"]):
+        return "plumber"
+    if any(tok in raw for tok in ["locksmith", "chaveiro", "cerrajero"]):
+        return "locksmith"
+    if any(tok in raw for tok in ["ac", "ar condicionado", "air conditioning", "hvac"]):
+        return "hvac"
+    return "general_service"
+
+
+def _pt_service_pitch(category: str, ab_variant: str, has_website: bool) -> str:
+    if has_website:
+        if ab_variant == "B":
+            return "E consigo melhorar bem o visual e os blocos de conversao do site atual para gerar mais pedidos."
+        return "E consigo elevar bastante o visual e a clareza do site atual para transformar visitas em pedidos."
+    mapping_a = {
+        "electrician": "Focada em eletricista, com CTA direto para urgencia, instalacao e manutencao.",
+        "plumber": "Focada em encanador, com CTA direto para vazamento, desentupimento e reparo rapido.",
+        "locksmith": "Focada em chaveiro, com CTA direto para emergencia, abertura e troca de fechadura.",
+        "hvac": "Focada em climatizacao, com CTA direto para instalacao, limpeza e manutencao.",
+        "general_service": "Focada em servico local, com CTA direto para orcamento e atendimento rapido.",
+    }
+    mapping_b = {
+        "electrician": "Com estrutura para eletricista: prova local, servicos principais e botao de contato imediato.",
+        "plumber": "Com estrutura para encanador: prova local, servicos principais e botao de contato imediato.",
+        "locksmith": "Com estrutura para chaveiro: prova local, servicos principais e botao de contato imediato.",
+        "hvac": "Com estrutura para climatizacao: prova local, servicos principais e botao de contato imediato.",
+        "general_service": "Com estrutura para prestador de servico: prova local, servicos principais e botao de contato imediato.",
+    }
+    return mapping_b.get(category, mapping_b["general_service"]) if ab_variant == "B" else mapping_a.get(category, mapping_a["general_service"])
+
+
 def _money(amount: int, currency_code: str, locale: str) -> str:
     if _is_pt_br(locale):
         return f"R$ {amount}"
@@ -192,8 +227,12 @@ def initial_consent_email(
     city: str = "",
     has_website: bool = False,
     locale: str = "en",
+    service_hint: str = "",
+    ab_variant: str = "A",
 ) -> tuple[str, str, str]:
     _ = variant
+    ab = "B" if str(ab_variant or "").strip().upper() == "B" else "A"
+    category = _service_category(service_hint)
     if _is_pt_br(locale):
         subject = f"{name}: posso te enviar uma pagina de vendas gratuita?"
     elif _is_spanish(locale):
@@ -203,18 +242,24 @@ def initial_consent_email(
     city_hint = city.strip() or "your area"
     if _is_pt_br(locale):
         city_hint = city.strip() or "sua regiao"
-        positioning = (
-            "Vi o site atual de voces e consigo criar uma versao bem mais impactante para gerar mais contatos.\n\n"
-            if has_website
-            else "Pra destacar o servico, passar confianca rapido e facilitar o contato logo na primeira tela.\n\n"
+        positioning = _pt_service_pitch(category, ab, has_website)
+        open_line = (
+            f"Encontrei a ficha de voces no Google em {city_hint} e vi uma oportunidade clara de transformar isso em mais clientes pra voces."
+            if ab == "A"
+            else f"Vi a ficha de voces no Google em {city_hint} e da para melhorar bastante a conversao disso para novos clientes."
+        )
+        closing_line = (
+            "Se topar ver essa versao gratis, so me dizer um OK que eu ja te mando!"
+            if ab == "A"
+            else "Se fizer sentido, me responde com um OK que eu te envio a versao gratuita ainda hoje."
         )
         body = (
             f"Oi, equipe {name}.\n\n"
-            f"Encontrei a ficha de voces no Google em {city_hint} e vi uma oportunidade clara de transformar isso em mais clientes pra voces.\n\n"
+            f"{open_line}\n\n"
             "Eu consigo criar uma pagina de vendas para voces, com visual profissional, carregamento rapido e estrutura pensada para converter em mensagem, ligacao e WhatsApp.\n\n"
-            f"{positioning}"
+            f"{positioning}\n\n"
             "Se quiser, eu monto uma versao gratuita inicialmente pra ver se gostam para o negocio de voces e te envio hoje, sem compromisso.\n\n"
-            "Se topar ver essa versao gratis, so me dizer um OK que eu ja te mando!\n\n"
+            f"{closing_line}\n\n"
             "Se nao quiser mais mensagens, descadastre aqui: "
             f"{unsubscribe_url}"
         )

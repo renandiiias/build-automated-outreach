@@ -580,6 +580,65 @@ def _reply_queue_snapshot(db_path: Path) -> dict[str, Any]:
     }
 
 
+def _template_performance_snapshot(
+    db_path: Path,
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+    approach_filter: str = "ALL",
+) -> dict[str, Any]:
+    defaults = {"rows": [], "ab_v2_handoff": []}
+    if not db_path.exists():
+        return defaults
+    try:
+        with sqlite3.connect(db_path) as conn:
+            lead_clauses, lead_params = _lead_filter_clauses(country_filter, audience_filter, approach_filter, "l")
+            where_clause = " AND ".join([*lead_clauses, "t.channel='EMAIL'", "t.intent IN ('IDENTITY_CHECK','CONSENT_REQUEST','OFFER')"])
+            rows = conn.execute(
+                f"""
+                SELECT
+                  t.template_id,
+                  COUNT(*) AS sent_count,
+                  COUNT(DISTINCT t.lead_id) AS unique_leads,
+                  COUNT(DISTINCT CASE
+                    WHEN EXISTS (
+                      SELECT 1 FROM replies r
+                      WHERE r.lead_id = t.lead_id
+                        AND r.channel='EMAIL'
+                        AND r.timestamp_utc >= t.timestamp_utc
+                    ) THEN t.lead_id
+                    ELSE NULL
+                  END) AS replied_leads
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                WHERE {where_clause}
+                GROUP BY t.template_id
+                ORDER BY sent_count DESC, t.template_id ASC
+                LIMIT 24
+                """,
+                lead_params,
+            ).fetchall()
+    except sqlite3.Error:
+        return defaults
+    out_rows: list[dict[str, Any]] = []
+    for row in rows:
+        template_id = str(row[0] or "")
+        sent_count = int(row[1] or 0)
+        unique_leads = int(row[2] or 0)
+        replied_leads = int(row[3] or 0)
+        reply_rate = (replied_leads / unique_leads) if unique_leads else 0.0
+        out_rows.append(
+            {
+                "template_id": template_id,
+                "sent_count": sent_count,
+                "unique_leads": unique_leads,
+                "replied_leads": replied_leads,
+                "reply_rate": reply_rate,
+            }
+        )
+    ab_rows = [r for r in out_rows if r["template_id"] in {"email_v2_handoff_a", "email_v2_handoff_b"}]
+    return {"rows": out_rows, "ab_v2_handoff": ab_rows}
+
+
 def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     counter = Counter()
     for e in events:
@@ -595,6 +654,7 @@ def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "reply_queued_for_codex": counter.get("reply_queued_for_codex", 0),
         "reply_sent": counter.get("reply_sent", 0),
         "domain_job_created": counter.get("domain_job_created", 0),
+        "ab_variant_assigned": counter.get("ab_variant_assigned", 0),
     }
 
 
@@ -621,6 +681,7 @@ def build_snapshot(country_filter: str = "ALL", audience_filter: str = "ALL", ap
         },
         "domain_ops": _domain_ops_snapshot(cfg.state_db),
         "reply_queue": _reply_queue_snapshot(cfg.state_db),
+        "template_performance": _template_performance_snapshot(cfg.state_db, country, audience, approach),
         "events_summary": _compute_event_summary(events),
         "events": events[-50:],
     }
@@ -690,6 +751,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     throughput = snap["throughput"]
     filters = snap["filters"]
     es = snap["events_summary"]
+    template_perf = snap["template_performance"]
     progress_pct = min(100, int((pricing["offers_in_window"] / 10) * 100))
     safe_mode = "ATIVO" if ops["global_safe_mode"] else "DESATIVADO"
     safe_class = "bad" if ops["global_safe_mode"] else "ok"
@@ -796,6 +858,20 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         )
         for ch in pace_channels
     ) or "<tr><td colspan='5'>Sem ritmo por canal ainda.</td></tr>"
+    template_rows = "".join(
+        (
+            f"<tr><td><b>{it['template_id']}</b></td><td>{it['sent_count']}</td><td>{it['unique_leads']}</td>"
+            f"<td>{it['replied_leads']}</td><td>{it['reply_rate'] * 100:.1f}%</td></tr>"
+        )
+        for it in template_perf["rows"][:12]
+    ) or "<tr><td colspan='5'>Sem dados de template.</td></tr>"
+    ab_rows = "".join(
+        (
+            f"<tr><td><b>{it['template_id']}</b></td><td>{it['sent_count']}</td><td>{it['replied_leads']}</td>"
+            f"<td>{it['reply_rate'] * 100:.1f}%</td></tr>"
+        )
+        for it in template_perf["ab_v2_handoff"]
+    ) or "<tr><td colspan='4'>Sem dados A/B ainda.</td></tr>"
     country_choices = [
         ("ALL", "Geral"),
         ("BR", "Brasil"),
@@ -1067,6 +1143,24 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
       <thead><tr><th>Canal</th><th>1h</th><th>24h</th><th>Volume 24h</th><th>Intensidade 1h</th></tr></thead>
       <tbody>{pace_rows}</tbody>
     </table>
+  </section>
+
+  <section class='grid split' style='margin-top:10px'>
+    <div class='card'>
+      <h2>Performance por Template (Email)</h2>
+      <table>
+        <thead><tr><th>Template</th><th>Envios</th><th>Leads</th><th>Com resposta</th><th>Taxa</th></tr></thead>
+        <tbody>{template_rows}</tbody>
+      </table>
+    </div>
+    <div class='card'>
+      <h2>A/B Fluxo 2 (Handoff)</h2>
+      <div class='muted'>Split por coorte do lead (A/B deterministico). Eventos de atribuicao: {es['ab_variant_assigned']}</div>
+      <table>
+        <thead><tr><th>Variante</th><th>Envios</th><th>Respostas</th><th>Taxa</th></tr></thead>
+        <tbody>{ab_rows}</tbody>
+      </table>
+    </div>
   </section>
 
   <section class='grid split' style='margin-top:10px'>

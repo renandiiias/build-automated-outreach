@@ -528,7 +528,7 @@ class CrmStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, business_name, phone, email, website, address, stage, approach_version
+                SELECT id, business_name, phone, email, website, address, stage, approach_version, audience
                 FROM leads
                 WHERE lower(email)=lower(?)
                 ORDER BY id DESC LIMIT 1
@@ -546,6 +546,7 @@ class CrmStore:
             "address": str(row[5] or ""),
             "stage": str(row[6] or ""),
             "approach_version": str(row[7] or "v1_legacy"),
+            "audience": str(row[8] or ""),
         }
 
     def get_lead_audience(self, lead_id: int) -> str:
