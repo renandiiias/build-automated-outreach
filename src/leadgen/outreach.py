@@ -145,6 +145,66 @@ def _location_hint(value: str, locale: str) -> str:
 
 def _identity_service_label(service_hint: str, locale: str) -> str:
     raw = (service_hint or "").strip().lower()
+    if any(tok in raw for tok in ["lawyer", "advogado", "abogado", "attorney", "solicitor"]):
+        if _is_pt_br(locale):
+            return "advogados"
+        if _is_spanish(locale):
+            return "abogados"
+        return "law firms"
+    if any(tok in raw for tok in ["accountant", "contador", "contable", "accounting"]):
+        if _is_pt_br(locale):
+            return "contadores"
+        if _is_spanish(locale):
+            return "contables"
+        return "accountants"
+    if any(tok in raw for tok in ["dentist", "dentista", "dental", "odont"]):
+        if _is_pt_br(locale):
+            return "dentistas"
+        if _is_spanish(locale):
+            return "dentistas"
+        return "dentists"
+    if any(tok in raw for tok in ["physiotherapist", "fisioterapeuta", "fisioterapia", "physio"]):
+        if _is_pt_br(locale):
+            return "fisioterapeutas"
+        if _is_spanish(locale):
+            return "fisioterapeutas"
+        return "physiotherapists"
+    if any(tok in raw for tok in ["psychologist", "psicologo", "psicólogo", "therapist", "therapy"]):
+        if _is_pt_br(locale):
+            return "psicologos"
+        if _is_spanish(locale):
+            return "psicologos"
+        return "psychologists"
+    if any(tok in raw for tok in ["architect", "arquiteto", "arquitecto", "architecture"]):
+        if _is_pt_br(locale):
+            return "arquitetos"
+        if _is_spanish(locale):
+            return "arquitectos"
+        return "architects"
+    if any(tok in raw for tok in ["financial advisor", "consultor financeiro", "asesor financiero"]):
+        if _is_pt_br(locale):
+            return "consultores financeiros"
+        if _is_spanish(locale):
+            return "asesores financieros"
+        return "financial advisors"
+    if any(tok in raw for tok in ["insurance broker", "corretor de seguros", "corredor de seguros"]):
+        if _is_pt_br(locale):
+            return "corretores de seguros"
+        if _is_spanish(locale):
+            return "corredores de seguros"
+        return "insurance brokers"
+    if any(tok in raw for tok in ["immigration consultant", "consultor de imigracao", "consultor de inmigracion"]):
+        if _is_pt_br(locale):
+            return "consultores de imigracao"
+        if _is_spanish(locale):
+            return "consultores de inmigracion"
+        return "immigration consultants"
+    if any(tok in raw for tok in ["business consultant", "consultor empresarial", "consultor de negocios"]):
+        if _is_pt_br(locale):
+            return "consultores empresariais"
+        if _is_spanish(locale):
+            return "consultores de negocios"
+        return "business consultants"
     if "hotel" in raw:
         if _is_pt_br(locale):
             return "hoteis"
@@ -178,6 +238,26 @@ def _identity_service_label(service_hint: str, locale: str) -> str:
 
 def _service_category(service_hint: str) -> str:
     raw = (service_hint or "").strip().lower()
+    if any(tok in raw for tok in ["lawyer", "advogado", "abogado", "attorney", "solicitor"]):
+        return "lawyer"
+    if any(tok in raw for tok in ["accountant", "contador", "contable", "accounting"]):
+        return "accountant"
+    if any(tok in raw for tok in ["dentist", "dentista", "dental", "odont"]):
+        return "dentist"
+    if any(tok in raw for tok in ["physiotherapist", "fisioterapeuta", "fisioterapia", "physio"]):
+        return "physio"
+    if any(tok in raw for tok in ["psychologist", "psicologo", "psicólogo", "therapist", "therapy"]):
+        return "psychologist"
+    if any(tok in raw for tok in ["architect", "arquiteto", "arquitecto", "architecture"]):
+        return "architect"
+    if any(tok in raw for tok in ["financial advisor", "consultor financeiro", "asesor financiero"]):
+        return "financial_advisor"
+    if any(tok in raw for tok in ["insurance broker", "corretor de seguros", "corredor de seguros"]):
+        return "insurance_broker"
+    if any(tok in raw for tok in ["immigration consultant", "consultor de imigracao", "consultor de inmigracion"]):
+        return "immigration_consultant"
+    if any(tok in raw for tok in ["business consultant", "consultor empresarial", "consultor de negocios"]):
+        return "business_consultant"
     if any(tok in raw for tok in ["electrician", "eletricista", "electricista"]):
         return "electrician"
     if any(tok in raw for tok in ["plumber", "encanador", "fontanero"]):
@@ -195,6 +275,16 @@ def _pt_service_pitch(category: str, ab_variant: str, has_website: bool) -> str:
             return "E consigo melhorar bem o visual e os blocos de conversao do site atual para gerar mais pedidos."
         return "E consigo elevar bastante o visual e a clareza do site atual para transformar visitas em pedidos."
     mapping_a = {
+        "lawyer": "Focada para advocacia, com linguagem de confianca e CTA direto para consulta.",
+        "accountant": "Focada para contabilidade, com oferta clara de diagnostico e CTA para atendimento rapido.",
+        "dentist": "Focada para dentista, com destaque para procedimentos e CTA para agendamento.",
+        "physio": "Focada para fisioterapia, com destaque para tratamentos e CTA para avaliacao inicial.",
+        "psychologist": "Focada para psicologia, com abordagem acolhedora e CTA para primeira sessao.",
+        "architect": "Focada para arquitetura, com portfolio visual e CTA para briefing inicial.",
+        "financial_advisor": "Focada para consultoria financeira, com posicionamento premium e CTA para analise inicial.",
+        "insurance_broker": "Focada para corretor de seguros, com comparativo de opcoes e CTA para cotacao.",
+        "immigration_consultant": "Focada para consultoria de imigracao, com passos claros e CTA para avaliacao do caso.",
+        "business_consultant": "Focada para consultoria empresarial, com proposta de valor objetiva e CTA para reuniao.",
         "electrician": "Focada em eletricista, com CTA direto para urgencia, instalacao e manutencao.",
         "plumber": "Focada em encanador, com CTA direto para vazamento, desentupimento e reparo rapido.",
         "locksmith": "Focada em chaveiro, com CTA direto para emergencia, abertura e troca de fechadura.",
@@ -202,6 +292,16 @@ def _pt_service_pitch(category: str, ab_variant: str, has_website: bool) -> str:
         "general_service": "Focada em servico local, com CTA direto para orcamento e atendimento rapido.",
     }
     mapping_b = {
+        "lawyer": "Com estrutura para advocacia: prova social, areas atendidas e botao de contato imediato.",
+        "accountant": "Com estrutura para contabilidade: servicos principais, prova local e botao de contato imediato.",
+        "dentist": "Com estrutura para dentista: especialidades, prova local e botao de agendamento imediato.",
+        "physio": "Com estrutura para fisioterapia: tratamentos, prova local e botao de contato imediato.",
+        "psychologist": "Com estrutura para psicologia: especialidades, credenciais e botao de contato imediato.",
+        "architect": "Com estrutura para arquitetura: portfolio, processo e botao de contato imediato.",
+        "financial_advisor": "Com estrutura para consultoria financeira: autoridade, clareza e botao de contato imediato.",
+        "insurance_broker": "Com estrutura para corretor de seguros: coberturas, prova local e botao de cotacao imediata.",
+        "immigration_consultant": "Com estrutura para consultoria de imigracao: etapas, prova social e botao de contato imediato.",
+        "business_consultant": "Com estrutura para consultoria empresarial: diagnostico, casos e botao de contato imediato.",
         "electrician": "Com estrutura para eletricista: prova local, servicos principais e botao de contato imediato.",
         "plumber": "Com estrutura para encanador: prova local, servicos principais e botao de contato imediato.",
         "locksmith": "Com estrutura para chaveiro: prova local, servicos principais e botao de contato imediato.",
@@ -218,6 +318,52 @@ def _money(amount: int, currency_code: str, locale: str) -> str:
     if code == "EUR":
         return f"EUR {amount}"
     return f"{code} {amount}"
+
+
+def _en_service_pitch(category: str, has_website: bool) -> str:
+    if has_website:
+        return "I can redesign your current site into a stronger conversion page with clearer messaging and better CTA flow."
+    mapping = {
+        "lawyer": "Built for law firms, with trust-first structure and a clear consultation CTA.",
+        "accountant": "Built for accountants, with service clarity and a direct CTA for first assessment.",
+        "dentist": "Built for dentists, with treatment highlights and booking-focused CTA.",
+        "physio": "Built for physiotherapists, with treatment positioning and first-session CTA.",
+        "psychologist": "Built for psychologists, with a trust-focused tone and first-contact CTA.",
+        "architect": "Built for architects, with portfolio-first layout and briefing CTA.",
+        "financial_advisor": "Built for financial advisors, with authority positioning and clear CTA.",
+        "insurance_broker": "Built for insurance brokers, with coverage clarity and quote CTA.",
+        "immigration_consultant": "Built for immigration consultants, with clear process steps and assessment CTA.",
+        "business_consultant": "Built for business consultants, with offer clarity and strategy-call CTA.",
+        "electrician": "Built for electricians, with urgency CTA and local proof.",
+        "plumber": "Built for plumbers, with emergency CTA and local proof.",
+        "locksmith": "Built for locksmiths, with emergency CTA and trust signals.",
+        "hvac": "Built for HVAC services, with maintenance CTA and local proof.",
+        "general_service": "Built for local services, with simple structure and fast-contact CTA.",
+    }
+    return mapping.get(category, mapping["general_service"])
+
+
+def _es_service_pitch(category: str, has_website: bool) -> str:
+    if has_website:
+        return "Puedo rediseñar su web actual para que convierta mejor, con mensaje más claro y CTA más fuerte."
+    mapping = {
+        "lawyer": "Pensada para despachos legales, con estructura de confianza y CTA de consulta.",
+        "accountant": "Pensada para contables, con servicios claros y CTA para primera evaluación.",
+        "dentist": "Pensada para clínicas dentales, con especialidades y CTA de cita.",
+        "physio": "Pensada para fisioterapia, con enfoque en tratamientos y CTA de primera evaluación.",
+        "psychologist": "Pensada para psicología, con tono de confianza y CTA de primer contacto.",
+        "architect": "Pensada para arquitectura, con portafolio visible y CTA de briefing.",
+        "financial_advisor": "Pensada para asesoría financiera, con posicionamiento profesional y CTA directo.",
+        "insurance_broker": "Pensada para seguros, con claridad de coberturas y CTA de cotización.",
+        "immigration_consultant": "Pensada para inmigración, con pasos claros y CTA de evaluación del caso.",
+        "business_consultant": "Pensada para consultoría de negocios, con propuesta clara y CTA de reunión.",
+        "electrician": "Pensada para electricistas, con CTA de urgencia y prueba local.",
+        "plumber": "Pensada para fontaneros, con CTA de urgencia y prueba local.",
+        "locksmith": "Pensada para cerrajeros, con CTA de urgencia y señales de confianza.",
+        "hvac": "Pensada para climatización, con CTA de mantenimiento y prueba local.",
+        "general_service": "Pensada para servicios locales, con estructura simple y CTA de contacto rápido.",
+    }
+    return mapping.get(category, mapping["general_service"])
 
 
 def initial_consent_email(
@@ -265,29 +411,19 @@ def initial_consent_email(
         )
     elif _is_spanish(locale):
         city_hint = city.strip() or "tu zona"
-        positioning = (
-            "Vi su web actual y puedo crear una version mucho mas impactante para generar mas consultas.\n\n"
-            if has_website
-            else "Vi una oportunidad clara para convertir mas visitas en mensajes y llamadas.\n\n"
-        )
+        positioning = _es_service_pitch(category, has_website)
         body = (
             f"Hola, equipo de {name}.\n\n"
-            f"Encontré su ficha en Google en {city_hint}. "
-            f"{positioning}"
+            f"Encontré su ficha en Google en {city_hint}. {positioning}\n\n"
             "Puedo montar una version concepto gratuita y enviarla hoy, sin compromiso.\n\n"
             "Si no quieren mas mensajes, pueden salir aqui: "
             f"{unsubscribe_url}"
         )
     else:
-        positioning = (
-            "I checked your current site and I can build a much more impactful version focused on calls and bookings.\n\n"
-            if has_website
-            else "I noticed there is a clear opportunity to convert more visitors into calls and WhatsApp leads.\n\n"
-        )
+        positioning = _en_service_pitch(category, has_website)
         body = (
             f"Hi {name} team,\n\n"
-            f"I found your Google Business listing in {city_hint}. "
-            f"{positioning}"
+            f"I found your Google Business listing in {city_hint}. {positioning}\n\n"
             "I can build a free concept page and send it over today, no commitment.\n\n"
             "If you do not want more messages, unsubscribe here: "
             f"{unsubscribe_url}"

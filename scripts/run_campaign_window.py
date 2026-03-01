@@ -87,10 +87,93 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_audience_variants(audience: str) -> list[str]:
+def _dedup_audience(items: list[str], fallback: str) -> list[str]:
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        dedup.append(item.strip())
+    return dedup or [fallback]
+
+
+def build_audience_variants(audience: str, country_code: str = "") -> list[str]:
     base = (audience or "").strip()
-    variants: list[str] = [base]
     lowered = base.lower()
+    cc = (country_code or "").strip().upper()
+    variants: list[str] = [base]
+
+    # 10 nichos de maior probabilidade de resposta via e-mail, por país/idioma.
+    country_niches: dict[str, list[str]] = {
+        "BR": [
+            "advogado",
+            "contador",
+            "dentista",
+            "fisioterapeuta",
+            "psicologo",
+            "arquiteto",
+            "consultor financeiro",
+            "corretor de seguros",
+            "consultor de imigracao",
+            "consultor empresarial",
+        ],
+        "PT": [
+            "advogado",
+            "contabilista",
+            "dentista",
+            "fisioterapeuta",
+            "psicologo",
+            "arquiteto",
+            "consultor financeiro",
+            "corretor de seguros",
+            "consultor de imigracao",
+            "consultor empresarial",
+        ],
+        "ES": [
+            "abogado",
+            "contable",
+            "dentista",
+            "fisioterapeuta",
+            "psicologo",
+            "arquitecto",
+            "asesor financiero",
+            "corredor de seguros",
+            "consultor de inmigracion",
+            "consultor de negocios",
+        ],
+        "UK": [
+            "lawyer",
+            "accountant",
+            "dentist",
+            "physiotherapist",
+            "psychologist",
+            "architect",
+            "financial advisor",
+            "insurance broker",
+            "immigration consultant",
+            "business consultant",
+        ],
+        "US": [
+            "lawyer",
+            "accountant",
+            "dentist",
+            "physiotherapist",
+            "psychologist",
+            "architect",
+            "financial advisor",
+            "insurance broker",
+            "immigration consultant",
+            "business consultant",
+        ],
+    }
+
+    # Se base for nicho específico (ex: electrician), mantém e adiciona rotação de teste.
+    # Se base for genérica, usa nichos do país como motor principal.
+    variants.extend(country_niches.get(cc, country_niches.get("UK", [])))
+
+    # Compatibilidade com variações antigas.
     replacements = [
         ("manutencao", "conserto"),
         ("manutenção", "conserto"),
@@ -101,22 +184,9 @@ def build_audience_variants(audience: str) -> list[str]:
         if old in lowered:
             variants.append(lowered.replace(old, new))
     if "ar condicionado" in lowered:
-        variants.extend(
-            [
-                "conserto de ar condicionado",
-                "limpeza de ar condicionado",
-                "refrigeracao residencial",
-            ]
-        )
-    dedup: list[str] = []
-    seen: set[str] = set()
-    for item in variants:
-        key = item.strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        dedup.append(item.strip())
-    return dedup or [base]
+        variants.extend(["conserto de ar condicionado", "limpeza de ar condicionado", "refrigeracao residencial"])
+
+    return _dedup_audience(variants, base)
 
 
 def _country_code_for_location(location: str) -> str:
@@ -279,9 +349,6 @@ def main() -> int:
 
     cycle = 0
     totals = {"ingested": 0, "consent_sent": 0, "followups_sent": 0, "offers_sent": 0}
-    audience_variants = [args.audience]
-    if not args.disable_audience_variants:
-        audience_variants = build_audience_variants(args.audience)
     locations = [args.location] + [x.strip() for x in args.fallback_locations.split(",") if x.strip()]
     countries_order, locations_by_country = _build_country_locations(locations)
     block_size = int(os.getenv("LEADGEN_COUNTRY_ROTATION_BLOCK", "20") or "20")
@@ -291,7 +358,6 @@ def main() -> int:
     while datetime.now(timezone.utc) < deadline:
         cycle += 1
         cycle_id = f"{run_id}-c{cycle:03d}"
-        audience_now = audience_variants[(cycle - 1) % len(audience_variants)]
         counts_by_country = _fetch_identity_touch_counts(runner.cfg.state_db, countries_order)
         selected_country = _pick_country_for_block(countries_order, counts_by_country, block_size)
         if selected_country and locations_by_country.get(selected_country):
@@ -301,6 +367,14 @@ def main() -> int:
         else:
             selected_country = _country_code_for_location(args.location)
             location_now = args.location
+
+        audience_variants = [args.audience]
+        if not args.disable_audience_variants:
+            audience_variants = build_audience_variants(args.audience, selected_country)
+
+        # Rotação de nicho por blocos de país para validar funcionamento por nicho e por geografia.
+        audience_block_index = (counts_by_country.get(selected_country, 0) // max(1, block_size)) % max(1, len(audience_variants))
+        audience_now = audience_variants[audience_block_index]
         country_count = counts_by_country.get(selected_country, 0)
         in_block = country_count % max(1, block_size)
         runner.logger.write(
@@ -311,6 +385,8 @@ def main() -> int:
                 "cycle": cycle,
                 "audience_variant": audience_now,
                 "location_variant": location_now,
+                "audience_variants_count": len(audience_variants),
+                "audience_block_index": audience_block_index,
                 "country_selected": selected_country,
                 "country_identity_touches": country_count,
                 "country_block_progress": f"{in_block}/{block_size}",
