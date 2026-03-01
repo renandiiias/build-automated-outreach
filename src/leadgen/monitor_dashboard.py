@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as html_lib
 import json
 import sqlite3
 from collections import Counter
@@ -753,26 +754,27 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     es = snap["events_summary"]
     template_perf = snap["template_performance"]
     progress_pct = min(100, int((pricing["offers_in_window"] / 10) * 100))
-    safe_mode = "ATIVO" if ops["global_safe_mode"] else "DESATIVADO"
-    safe_class = "bad" if ops["global_safe_mode"] else "ok"
+    safe_mode = "ATIVO" if ops["global_safe_mode"] else "NORMAL"
+    safe_class = "is-bad" if ops["global_safe_mode"] else "is-ok"
     baseline_txt = f"{pricing['baseline_conversion'] * 100:.1f}%" if pricing["baseline_conversion"] is not None else "n/a"
     conv_txt = f"{funnel['conversion_7d'] * 100:.1f}%"
     event_age = throughput.get("last_event_age_min")
     if event_age is None:
         activity_txt = "Sem atividade recente"
-        activity_class = "warn"
+        activity_class = "is-warn"
     elif event_age <= 3:
-        activity_txt = "Agora mesmo"
-        activity_class = "ok"
+        activity_txt = "Agora"
+        activity_class = "is-ok"
     elif event_age <= 20:
         activity_txt = f"{event_age} min atras"
-        activity_class = "ok"
+        activity_class = "is-ok"
     elif event_age <= 60:
         activity_txt = f"{event_age} min atras"
-        activity_class = "warn"
+        activity_class = "is-warn"
     else:
         activity_txt = f"{event_age} min atras"
-        activity_class = "bad"
+        activity_class = "is-bad"
+
     lead_total_geo = max(1, sum(int(it["leads"]) for it in geo["by_country"]))
     max_channel_touches = max([int(it["touches"]) for it in geo["approaches_by_channel"]] or [1])
     max_country_channel_touches = max([int(it["touches"]) for it in geo["approaches_by_country_channel"]] or [1])
@@ -784,6 +786,10 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     selected_country = filters["country"]
     selected_audience = filters["audience"]
     selected_approach = filters["approach"]
+    queue_backlog = queue["counts"]["pending"] + queue["counts"]["review_required"]
+    queue_label = "Atenção" if queue_backlog >= 10 else ("Fila ativa" if queue_backlog else "Sem fila")
+    queue_class = "is-bad" if queue_backlog >= 10 else ("is-warn" if queue_backlog else "is-ok")
+
     current_scope = {
         "ALL": "Geral",
         "BR": "Brasil",
@@ -793,85 +799,167 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         "US": "USA",
         "ES": "Espanha",
     }.get(selected_country, "Geral")
-    dashboard_title = "Painel Comercial LeadGenerator"
-    dashboard_badge = "Fluxo 1"
-    if selected_approach == "V2":
-        dashboard_title = "Painel Comercial LeadGenerator 2"
-        dashboard_badge = "Fluxo 2"
+    dashboard_title = "LeadGenerator 2"
+    dashboard_badge = "Fluxo 2"
+    if selected_approach == "LEGACY":
+        dashboard_title = "LeadGenerator 1"
+        dashboard_badge = "Fluxo 1"
     scope_suffix = "" if selected_audience == "ALL" else f" | Nicho: {selected_audience}"
+
+    def _safe(value: Any) -> str:
+        return html_lib.escape(str(value or ""))
+
+    def _status_badge(status: str) -> str:
+        norm = (status or "").upper()
+        if norm in {"ACTIVE", "OK", "ENABLED"}:
+            return "is-ok"
+        if norm in {"PAUSED", "STOPPED"}:
+            return "is-warn"
+        if norm in {"ERROR", "FAILED", "DISABLED", "BLOCKED"}:
+            return "is-bad"
+        return "is-neutral"
+
     dashboard_nav = (
         f"<a class='filter-pill {'is-active' if selected_approach == 'LEGACY' else ''}' "
-        f"href='/dashboard?country={quote_plus(selected_country)}&audience={quote_plus(selected_audience)}'>Ver dashboard 1</a>"
+        f"href='/dashboard?country={quote_plus(selected_country)}&audience={quote_plus(selected_audience)}'>Dashboard 1</a>"
         f"<a class='filter-pill {'is-active' if selected_approach == 'V2' else ''}' "
-        f"href='/dashboard2?country={quote_plus(selected_country)}&audience={quote_plus(selected_audience)}'>Ver dashboard 2</a>"
+        f"href='/dashboard2?country={quote_plus(selected_country)}&audience={quote_plus(selected_audience)}'>Dashboard 2</a>"
     )
 
     stage_funnel = [
-        ("Leads 7d", funnel["leads_7d"]),
-        ("Consentidos 7d", funnel["consented_7d"]),
-        ("Ofertas 7d", funnel["offers_7d"]),
-        ("Vendas 7d", funnel["won_7d"]),
-        ("Perdidos 7d", funnel["lost_7d"]),
+        ("Leads", funnel["leads_7d"]),
+        ("Consentidos", funnel["consented_7d"]),
+        ("Ofertas", funnel["offers_7d"]),
+        ("Vendas", funnel["won_7d"]),
+        ("Perdidos", funnel["lost_7d"]),
     ]
-    funnel_rows = "".join(
-        f"<div class='funnel-item'><span>{label}</span><b>{value}</b></div>" for label, value in stage_funnel
-    )
+    stage_base = max(1, stage_funnel[0][1])
+    funnel_rows = ""
+    for idx, (label, value) in enumerate(stage_funnel):
+        width = max(4, int((value / stage_base) * 100)) if stage_base else 4
+        next_value = stage_funnel[idx + 1][1] if idx + 1 < len(stage_funnel) else None
+        drop_info = ""
+        if next_value is not None:
+            drop_abs = max(0, value - next_value)
+            drop_pct = (drop_abs / value * 100) if value else 0
+            drop_info = f"<span class='funnel-drop'>Queda: {drop_abs} ({drop_pct:.0f}%)</span>"
+        funnel_rows += (
+            f"<div class='funnel-row'>"
+            f"<div class='funnel-head'><span>{_safe(label)}</span><b>{value}</b>{drop_info}</div>"
+            f"<div class='meter meter-funnel'><i style='width:{width}%'></i></div>"
+            f"</div>"
+        )
+
     pending_rows = "".join(
-        f"<tr><td>#{it['id']}</td><td>Lead {it['lead_id']}</td><td>{it['created_at_utc']}</td><td><code>{it['inbound_text']}</code></td></tr>"
+        (
+            f"<tr>"
+            f"<td>#{it['id']}</td>"
+            f"<td>Lead {it['lead_id']}</td>"
+            f"<td>{_safe(it['created_at_utc'])}</td>"
+            f"<td><code>{_safe((it['inbound_text'] or '')[:220])}</code></td>"
+            f"</tr>"
+        )
         for it in queue["top_pending"]
     ) or "<tr><td colspan='4'>Sem pendencias.</td></tr>"
 
     domain_rows = "".join(
-        f"<tr><td>{d['id']}</td><td>{d['domain_name'] or '-'}</td><td>{d['status']}</td><td>{d['days_left'] if d['days_left'] is not None else '-'}</td></tr>"
+        (
+            f"<tr>"
+            f"<td>{d['id']}</td>"
+            f"<td>{_safe(d['domain_name'] or '-')}</td>"
+            f"<td><span class='status-chip {_status_badge(str(d['status']))}'>{_safe(d['status'])}</span></td>"
+            f"<td>{d['days_left'] if d['days_left'] is not None else '-'}</td>"
+            f"</tr>"
+        )
         for d in domains["next_expiring"][:8]
     ) or "<tr><td colspan='4'>Sem dominios com expiracao registrada.</td></tr>"
 
     channel_rows = "".join(
-        f"<tr><td>{c['channel']}</td><td>{c['status']}</td><td>{c['reason'] or '-'}</td></tr>" for c in ops["channels"]
+        (
+            f"<tr>"
+            f"<td><b>{_safe(c['channel'])}</b></td>"
+            f"<td><span class='status-chip {_status_badge(str(c['status']))}'>{_safe(c['status'])}</span></td>"
+            f"<td>{_safe(c['reason'] or '-')}</td>"
+            f"</tr>"
+        )
+        for c in ops["channels"]
     ) or "<tr><td colspan='3'>Sem canais registrados.</td></tr>"
+
     country_rows = "".join(
         (
-            f"<tr><td><b>{it['country']}</b></td><td>{it['leads']}</td>"
-            f"<td><div class='meter'><i style='width:{max(4, int((int(it['leads']) / lead_total_geo) * 100))}%'></i></div></td></tr>"
+            f"<tr>"
+            f"<td><b>{_safe(it['country'])}</b></td>"
+            f"<td>{it['leads']}</td>"
+            f"<td>{(int(it['leads']) / lead_total_geo) * 100:.1f}%</td>"
+            f"<td><div class='meter'><i style='width:{max(4, int((int(it['leads']) / lead_total_geo) * 100))}%'></i></div></td>"
+            f"</tr>"
         )
         for it in geo["by_country"]
-    ) or "<tr><td colspan='3'>Sem dados por pais.</td></tr>"
+    ) or "<tr><td colspan='4'>Sem dados por pais.</td></tr>"
+
     approach_channel_rows = "".join(
         (
-            f"<tr><td><b>{it['channel']}</b></td><td>{it['touches']}</td>"
-            f"<td><div class='meter'><i style='width:{max(4, int((int(it['touches']) / max_channel_touches) * 100))}%'></i></div></td></tr>"
+            f"<tr>"
+            f"<td><b>{_safe(it['channel'])}</b></td>"
+            f"<td>{it['touches']}</td>"
+            f"<td><div class='meter'><i style='width:{max(4, int((int(it['touches']) / max_channel_touches) * 100))}%'></i></div></td>"
+            f"</tr>"
         )
         for it in geo["approaches_by_channel"]
     ) or "<tr><td colspan='3'>Sem abordagens registradas.</td></tr>"
+
     approach_country_channel_rows = "".join(
         (
-            f"<tr><td>{it['country']}</td><td>{it['channel']}</td><td>{it['touches']}</td>"
-            f"<td><div class='meter'><i style='width:{max(4, int((int(it['touches']) / max_country_channel_touches) * 100))}%'></i></div></td></tr>"
+            f"<tr>"
+            f"<td>{_safe(it['country'])}</td>"
+            f"<td>{_safe(it['channel'])}</td>"
+            f"<td>{it['touches']}</td>"
+            f"<td><div class='meter'><i style='width:{max(4, int((int(it['touches']) / max_country_channel_touches) * 100))}%'></i></div></td>"
+            f"</tr>"
         )
         for it in geo["approaches_by_country_channel"][:20]
     ) or "<tr><td colspan='4'>Sem cruzamento pais/canal.</td></tr>"
+
     pace_rows = "".join(
         (
-            f"<tr><td><b>{ch}</b></td><td>{ch_1h.get(ch, 0)}</td><td>{ch_24h.get(ch, 0)}</td>"
+            f"<tr>"
+            f"<td><b>{_safe(ch)}</b></td>"
+            f"<td>{ch_1h.get(ch, 0)}</td>"
+            f"<td>{ch_24h.get(ch, 0)}</td>"
             f"<td><div class='meter'><i style='width:{max(4, int((ch_24h.get(ch, 0) / pace_max_24h) * 100))}%'></i></div></td>"
-            f"<td><div class='meter meter-cool'><i style='width:{max(4, int((ch_1h.get(ch, 0) / pace_max_1h) * 100))}%'></i></div></td></tr>"
+            f"<td><div class='meter meter-cool'><i style='width:{max(4, int((ch_1h.get(ch, 0) / pace_max_1h) * 100))}%'></i></div></td>"
+            f"</tr>"
         )
         for ch in pace_channels
     ) or "<tr><td colspan='5'>Sem ritmo por canal ainda.</td></tr>"
+
+    max_reply_rate = max([float(it["reply_rate"]) for it in template_perf["rows"]] or [0.01])
     template_rows = "".join(
         (
-            f"<tr><td><b>{it['template_id']}</b></td><td>{it['sent_count']}</td><td>{it['unique_leads']}</td>"
-            f"<td>{it['replied_leads']}</td><td>{it['reply_rate'] * 100:.1f}%</td></tr>"
+            f"<tr class='{'is-row-highlight' if float(it['reply_rate']) >= 0.08 else ''}'>"
+            f"<td><b>{_safe(it['template_id'])}</b></td>"
+            f"<td>{it['sent_count']}</td>"
+            f"<td>{it['unique_leads']}</td>"
+            f"<td>{it['replied_leads']}</td>"
+            f"<td>{it['reply_rate'] * 100:.1f}%</td>"
+            f"<td><div class='meter meter-spark'><i style='width:{max(4, int((float(it['reply_rate']) / max_reply_rate) * 100))}%'></i></div></td>"
+            f"</tr>"
         )
         for it in template_perf["rows"][:12]
-    ) or "<tr><td colspan='5'>Sem dados de template.</td></tr>"
+    ) or "<tr><td colspan='6'>Sem dados de template.</td></tr>"
+
     ab_rows = "".join(
         (
-            f"<tr><td><b>{it['template_id']}</b></td><td>{it['sent_count']}</td><td>{it['replied_leads']}</td>"
-            f"<td>{it['reply_rate'] * 100:.1f}%</td></tr>"
+            f"<tr>"
+            f"<td><b>{_safe(it['template_id'])}</b></td>"
+            f"<td>{it['sent_count']}</td>"
+            f"<td>{it['replied_leads']}</td>"
+            f"<td>{it['reply_rate'] * 100:.1f}%</td>"
+            f"</tr>"
         )
         for it in template_perf["ab_v2_handoff"]
     ) or "<tr><td colspan='4'>Sem dados A/B ainda.</td></tr>"
+
     country_choices = [
         ("ALL", "Geral"),
         ("BR", "Brasil"),
@@ -896,19 +984,60 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         (
             f"<a class='filter-pill {'is-active' if selected_audience == item['audience'] else ''}' "
             f"href='/{'dashboard2' if selected_approach == 'V2' else 'dashboard'}?country={quote_plus(selected_country)}&audience={quote_plus(item['audience'])}'>"
-            f"{item['audience']} <span>{item['count']}</span></a>"
+            f"{_safe(item['audience'])} <span>{item['count']}</span></a>"
         )
         for item in filters["audience_options"]
     )
 
-    event_rows = ""
-    for e in reversed(snap["events"][-18:]):
-        ts = str(e.get("timestamp_utc", ""))
+    alerts: list[tuple[str, str, str]] = []
+    if ops["global_safe_mode"]:
+        alerts.append(("critical", "GLOBAL SAFE MODE", "Dois canais pausados no mesmo dia. Novos envios devem permanecer bloqueados."))
+    paused_channels = [str(c["channel"]) for c in ops["channels"] if str(c.get("status", "")).upper() != "ACTIVE"]
+    if paused_channels:
+        alerts.append(("warning", "Canal em pausa", f"Canais com restricao: {', '.join(paused_channels[:4])}."))
+    fail_rate = (es["contact_failed"] / max(1, es["contact_failed"] + es["contact_delivered"])) * 100
+    if fail_rate >= 20:
+        alerts.append(("warning", "Falhas de entrega elevadas", f"Falha atual: {fail_rate:.1f}% (ultimos eventos)."))
+    if queue_backlog >= 10:
+        alerts.append(("warning", "Fila Codex acumulada", f"{queue_backlog} respostas aguardando revisao."))
+    if throughput["touches_1h_total"] == 0 and throughput["touches_24h_total"] > 0:
+        alerts.append(("info", "Ritmo momentaneamente baixo", "Ultima hora sem disparos, mas houve atividade nas ultimas 24h."))
+    if not alerts:
+        alerts.append(("ok", "Operacao estavel", "Sem alertas criticos no momento."))
+
+    alert_rows = "".join(
+        (
+            f"<div class='alert-card alert-{_safe(level)}'>"
+            f"<div class='alert-title'>{_safe(title)}</div>"
+            f"<div class='alert-body'>{_safe(body)}</div>"
+            f"</div>"
+        )
+        for level, title, body in alerts
+    )
+
+    event_feed = ""
+    for e in reversed(snap["events"][-20:]):
+        ts = _safe(e.get("timestamp_utc", ""))
         ev = str(e.get("event_type", ""))
-        payload = json.dumps(e.get("payload", {}), ensure_ascii=False)
-        event_rows += f"<tr><td>{ts}</td><td>{ev}</td><td><code>{payload}</code></td></tr>"
-    if not event_rows:
-        event_rows = "<tr><td colspan='3'>Sem eventos ainda.</td></tr>"
+        payload_txt = json.dumps(e.get("payload", {}), ensure_ascii=False)
+        if len(payload_txt) > 260:
+            payload_txt = payload_txt[:260] + "..."
+        severity = "neutral"
+        low_ev = ev.lower()
+        if "failed" in low_ev or "error" in low_ev or "paused" in low_ev or "down" in low_ev:
+            severity = "bad"
+        elif "sent" in low_ev or "sale" in low_ev or "up" in low_ev:
+            severity = "ok"
+        elif "queued" in low_ev or "review" in low_ev:
+            severity = "warn"
+        event_feed += (
+            f"<article class='event-card sev-{severity}'>"
+            f"<div class='event-head'><span class='event-type'>{_safe(ev)}</span><span>{ts}</span></div>"
+            f"<code>{_safe(payload_txt)}</code>"
+            f"</article>"
+        )
+    if not event_feed:
+        event_feed = "<div class='muted'>Sem eventos ainda.</div>"
 
     return f"""<!doctype html>
 <html lang='pt-BR'>
@@ -916,303 +1045,612 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
   <meta charset='utf-8'/>
   <meta name='viewport' content='width=device-width, initial-scale=1'/>
   <meta http-equiv='refresh' content='10'/>
-  <title>LeadGenerator - Painel Comercial</title>
+  <title>LeadGenerator - Dashboard Comercial</title>
   <style>
     :root {{
-      --bg0:#f7fafc;
-      --bg1:#e7eef7;
+      --bg:#f4f7fb;
+      --bg-soft:#e8eef7;
       --card:#ffffff;
-      --ink:#111827;
+      --card-soft:#f7fafc;
+      --text:#111827;
       --muted:#4b5563;
-      --line:#e5e7eb;
-      --ok:#15803d;
-      --warn:#c2410c;
-      --bad:#b91c1c;
+      --line:#dbe3ee;
       --brand:#0f766e;
-      --brand2:#0369a1;
+      --brand-2:#0f4c81;
       --accent:#1d4ed8;
-      --shadow:0 8px 24px rgba(2, 6, 23, 0.07);
+      --ok:#15803d;
+      --warn:#b45309;
+      --bad:#b91c1c;
+      --neutral:#334155;
+      --shadow:0 10px 28px rgba(15, 23, 42, 0.09);
+    }}
+    html[data-theme='dark'] {{
+      --bg:#0b1220;
+      --bg-soft:#111a2d;
+      --card:#121c2f;
+      --card-soft:#0f172a;
+      --text:#e5e7eb;
+      --muted:#9ca3af;
+      --line:#23304a;
+      --brand:#2dd4bf;
+      --brand-2:#38bdf8;
+      --accent:#60a5fa;
+      --ok:#22c55e;
+      --warn:#f59e0b;
+      --bad:#ef4444;
+      --neutral:#94a3b8;
+      --shadow:0 10px 30px rgba(2, 6, 23, 0.5);
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
+      color: var(--text);
       font-family: "Avenir Next", "Segoe UI", sans-serif;
-      color: var(--ink);
       background:
-        radial-gradient(1000px 400px at 100% -10%, rgba(3, 105, 161, .16) 0%, transparent 70%),
-        radial-gradient(900px 300px at -10% -10%, rgba(15, 118, 110, .18) 0%, transparent 75%),
-        linear-gradient(180deg, var(--bg1), var(--bg0));
+        radial-gradient(1200px 500px at 110% -20%, rgba(15, 118, 110, .16), transparent 72%),
+        radial-gradient(1000px 420px at -15% -20%, rgba(15, 76, 129, .18), transparent 78%),
+        linear-gradient(180deg, var(--bg-soft), var(--bg));
     }}
-    .wrap {{ max-width: 1280px; margin: 0 auto; padding: 18px 18px 30px; }}
-    .hero {{
-      border: 1px solid #dbe3ee;
-      background: linear-gradient(135deg, #ffffff 0%, #f0f7ff 45%, #ecfdf5 100%);
-      border-radius: 16px;
-      padding: 16px 18px;
-      margin-bottom: 14px;
-      box-shadow: var(--shadow);
+    .page {{ max-width: 1420px; margin: 0 auto; padding: 14px 16px 28px; }}
+    .topbar {{
+      position: sticky;
+      top: 0;
+      z-index: 11;
+      margin-bottom: 10px;
+      backdrop-filter: blur(8px);
+      background: color-mix(in srgb, var(--bg-soft) 70%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 9px 12px;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
     }}
-    .hero h1 {{ margin: 0; font-size: 24px; letter-spacing: 0.2px; }}
-    .hero p {{ margin: 4px 0 0; color: var(--muted); font-size: 13px; }}
-    .hero-top {{ display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }}
-    .badge {{
+    .chip-row {{ display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }}
+    .chip {{
+      border: 1px solid var(--line);
       border-radius: 999px;
       padding: 5px 10px;
       font-size: 12px;
-      font-weight: 600;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--muted);
-    }}
-    .badge-activity {{
-      color: #0f172a;
       font-weight: 700;
-      background: #eff6ff;
-      border-color: #bfdbfe;
+      background: var(--card);
+      color: var(--muted);
+      transition: .2s ease;
+    }}
+    .chip b {{ color: var(--text); }}
+    .chip.is-ok {{ border-color: color-mix(in srgb, var(--ok) 42%, var(--line)); color: var(--ok); }}
+    .chip.is-warn {{ border-color: color-mix(in srgb, var(--warn) 42%, var(--line)); color: var(--warn); }}
+    .chip.is-bad {{ border-color: color-mix(in srgb, var(--bad) 42%, var(--line)); color: var(--bad); }}
+    .chip.is-neutral {{ border-color: var(--line); color: var(--neutral); }}
+    .theme-toggle {{
+      border: 1px solid var(--line);
+      background: var(--card);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 7px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      font-weight: 700;
+    }}
+    .hero {{
+      border: 1px solid var(--line);
+      background: linear-gradient(130deg, var(--card) 0%, color-mix(in srgb, var(--accent) 8%, var(--card)) 45%, color-mix(in srgb, var(--brand) 14%, var(--card)) 100%);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+      margin-bottom: 10px;
+    }}
+    .hero-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }}
+    .hero h1 {{ margin: 0; font-size: 27px; letter-spacing: 0.2px; }}
+    .hero .subtitle {{
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
     }}
     .filters {{
-      display:flex;
-      gap:8px;
-      flex-wrap:wrap;
-      margin-top:10px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
     }}
     .filter-pill {{
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
-      text-decoration:none;
-      border-radius:999px;
-      padding:7px 12px;
-      border:1px solid var(--line);
-      background:#ffffff;
-      color:var(--muted);
-      font-size:12px;
-      font-weight:600;
-      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
-    }}
-    .filter-pill span {{
-      color: var(--accent);
-      font-weight: 700;
-    }}
-    .filter-pill.is-active {{
-      background: linear-gradient(135deg, #eff6ff, #ecfdf5);
-      border-color: #bfdbfe;
-      color: #0f172a;
-    }}
-    .grid {{ display: grid; gap: 10px; }}
-    .kpis {{ grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }}
-    .split {{ grid-template-columns: 1.6fr 1fr; }}
-    .triple {{ grid-template-columns: 1fr 1fr 1fr; }}
-    .card {{
-      background: var(--card);
+      text-decoration: none;
+      border-radius: 999px;
+      padding: 6px 11px;
       border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 14px;
+      background: var(--card);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      transition: .18s ease;
+    }}
+    .filter-pill:hover {{
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+      color: var(--text);
+    }}
+    .filter-pill span {{ color: var(--accent); }}
+    .filter-pill.is-active {{
+      background: linear-gradient(120deg, color-mix(in srgb, var(--accent) 15%, var(--card)), color-mix(in srgb, var(--brand) 16%, var(--card)));
+      border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+      color: var(--text);
+    }}
+    .alerts {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }}
+    .alert-card {{
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      padding: 10px 12px;
       box-shadow: var(--shadow);
     }}
-    .kpi-title {{ font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.6px; }}
-    .kpi-value {{ font-size: 30px; font-weight: 750; margin-top: 2px; line-height: 1.05; }}
-    .ok {{ color: var(--ok); }} .bad {{ color: var(--bad); }} .warn {{ color: var(--warn); }}
-    .price-row {{ display:flex; gap:10px; margin-top:6px; }}
-    .pill {{
-      border-radius: 999px;
+    .alert-card.alert-critical {{
+      border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
+      background: color-mix(in srgb, var(--bad) 8%, var(--card));
+    }}
+    .alert-card.alert-warning {{
+      border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+      background: color-mix(in srgb, var(--warn) 8%, var(--card));
+    }}
+    .alert-card.alert-info {{
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+      background: color-mix(in srgb, var(--accent) 8%, var(--card));
+    }}
+    .alert-card.alert-ok {{
+      border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+      background: color-mix(in srgb, var(--ok) 8%, var(--card));
+    }}
+    .alert-title {{ font-size: 12px; font-weight: 800; letter-spacing: 0.2px; text-transform: uppercase; }}
+    .alert-body {{ margin-top: 4px; font-size: 13px; color: var(--muted); line-height: 1.35; }}
+    .kpi-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }}
+    .card {{
       border: 1px solid var(--line);
-      padding: 4px 10px;
-      font-size: 12px;
+      border-radius: 14px;
+      background: var(--card);
+      box-shadow: var(--shadow);
+      padding: 12px;
+    }}
+    .card-title {{
+      margin: 0 0 8px;
+      font-size: 15px;
+      letter-spacing: 0.2px;
+    }}
+    .kpi-label {{
       color: var(--muted);
-      background: #f8fafc;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.55px;
+      font-weight: 700;
+    }}
+    .kpi-value {{
+      font-size: 30px;
+      font-weight: 800;
+      line-height: 1.05;
+      margin-top: 3px;
+      letter-spacing: -0.2px;
+    }}
+    .kpi-foot {{
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .pill-row {{ margin-top: 6px; display: flex; gap: 7px; flex-wrap: wrap; }}
+    .pill {{
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--card-soft);
+      font-weight: 700;
     }}
     .progress {{
-      width: 100%; height: 11px; border-radius: 999px; background: #e5e7eb; overflow: hidden; margin-top: 8px;
+      margin-top: 8px;
+      width: 100%;
+      height: 10px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: color-mix(in srgb, var(--line) 70%, var(--card-soft));
     }}
     .progress > i {{
-      display:block; height: 100%; width: {progress_pct}%;
-      background: linear-gradient(90deg, var(--brand), var(--accent), var(--brand2));
+      display: block;
+      height: 100%;
+      width: {progress_pct}%;
+      background: linear-gradient(90deg, var(--brand), var(--accent), var(--brand-2));
+      transition: width .25s ease;
     }}
-    h2 {{ margin: 0 0 8px; font-size: 16px; }}
-    .funnel {{ display:grid; gap:7px; }}
-    .funnel-item {{
-      display:flex; justify-content:space-between; align-items:center;
-      border:1px solid var(--line); border-radius:10px; padding:9px 11px;
-      background: linear-gradient(180deg, #ffffff, #f8fafc);
+    .main-layout {{
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 2fr 1fr;
+      margin-bottom: 10px;
     }}
-    table {{ width:100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ border-bottom:1px solid var(--line); text-align:left; padding:7px 6px; vertical-align:top; }}
-    th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }}
-    code {{ white-space: pre-wrap; word-break: break-word; color:#0f172a; font-family: "SFMono-Regular", Menlo, monospace; }}
-    .muted {{ color: var(--muted); font-size: 12px; }}
+    .sub-grid {{
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-bottom: 10px;
+    }}
+    .funnel-stack {{ display: grid; gap: 8px; }}
+    .funnel-row {{
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      background: var(--card-soft);
+    }}
+    .funnel-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+      font-size: 13px;
+    }}
+    .funnel-head b {{ font-size: 16px; }}
+    .funnel-drop {{
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }}
     .meter {{
       width: 100%;
       height: 8px;
-      background: #e5e7eb;
       border-radius: 999px;
       overflow: hidden;
-      min-width: 120px;
+      background: color-mix(in srgb, var(--line) 75%, var(--card-soft));
+      min-width: 110px;
     }}
     .meter > i {{
-      display:block;
-      height:100%;
+      display: block;
+      height: 100%;
       background: linear-gradient(90deg, var(--brand), var(--accent));
+    }}
+    .meter-funnel > i {{
+      background: linear-gradient(90deg, color-mix(in srgb, var(--brand) 80%, white), color-mix(in srgb, var(--accent) 70%, white));
     }}
     .meter-cool > i {{
       background: linear-gradient(90deg, #0ea5e9, #6366f1);
     }}
-    .compact {{ max-height: 420px; overflow: auto; }}
-    @media (max-width: 940px) {{
-      .split, .triple {{ grid-template-columns: 1fr; }}
+    .meter-spark > i {{
+      background: linear-gradient(90deg, #22c55e, #06b6d4);
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      padding: 7px 6px;
+      vertical-align: middle;
+    }}
+    th {{
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      position: sticky;
+      top: 0;
+      background: var(--card);
+      z-index: 1;
+    }}
+    .scroll-table {{
+      max-height: 360px;
+      overflow: auto;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+    }}
+    .scroll-table table th:first-child {{ padding-left: 10px; }}
+    .scroll-table table td:first-child {{ padding-left: 10px; }}
+    .status-chip {{
+      border-radius: 999px;
+      padding: 3px 8px;
+      border: 1px solid var(--line);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+    }}
+    .status-chip.is-ok {{ color: var(--ok); border-color: color-mix(in srgb, var(--ok) 42%, var(--line)); }}
+    .status-chip.is-warn {{ color: var(--warn); border-color: color-mix(in srgb, var(--warn) 42%, var(--line)); }}
+    .status-chip.is-bad {{ color: var(--bad); border-color: color-mix(in srgb, var(--bad) 42%, var(--line)); }}
+    .status-chip.is-neutral {{ color: var(--neutral); }}
+    .is-row-highlight {{
+      background: color-mix(in srgb, var(--ok) 8%, var(--card));
+    }}
+    .aside-stack {{
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }}
+    .event-feed {{
+      display: grid;
+      gap: 8px;
+      max-height: 500px;
+      overflow: auto;
+      padding-right: 2px;
+    }}
+    .event-card {{
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--card-soft);
+      padding: 8px;
+    }}
+    .event-card.sev-ok {{ border-left: 4px solid var(--ok); }}
+    .event-card.sev-warn {{ border-left: 4px solid var(--warn); }}
+    .event-card.sev-bad {{ border-left: 4px solid var(--bad); }}
+    .event-card.sev-neutral {{ border-left: 4px solid var(--neutral); }}
+    .event-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }}
+    .event-type {{
+      font-weight: 800;
+      color: var(--text);
+      font-size: 12px;
+    }}
+    .event-card code {{
+      white-space: pre-wrap;
+      word-break: break-word;
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+    }}
+    .muted {{ color: var(--muted); font-size: 12px; }}
+    .legend {{
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }}
+    .legend .chip {{ font-weight: 700; }}
+    @media (max-width: 1180px) {{
+      .main-layout {{ grid-template-columns: 1fr; }}
+    }}
+    @media (max-width: 920px) {{
+      .kpi-grid {{ grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }}
+      .sub-grid {{ grid-template-columns: 1fr; }}
       .kpi-value {{ font-size: 24px; }}
+      .hero h1 {{ font-size: 23px; }}
     }}
   </style>
 </head>
 <body>
-<div class='wrap'>
-  <section class='hero'>
-    <div class='hero-top'>
-      <h1>{dashboard_title}</h1>
-      <span class='badge'>Atualizacao automatica: 10s</span>
-    </div>
-    <p>Atualizado em {snap['generated_at_utc']} (UTC). Status global: <b class='{safe_class}'>{safe_mode}</b>. Escopo: <b>{current_scope}</b>{scope_suffix}. Coorte: <b>{dashboard_badge}</b>.</p>
-    <div class='hero-top' style='margin-top:8px'>
-      <span class='badge badge-activity'>Ultima atividade: <b class='{activity_class}'>{activity_txt}</b></span>
-      <span class='badge'>Abordagens 1h: <b>{throughput['touches_1h_total']}</b></span>
-      <span class='badge'>Abordagens 24h: <b>{throughput['touches_24h_total']}</b></span>
-      <span class='badge'>Leads novos 24h: <b>{throughput['new_leads_24h']}</b></span>
-      <span class='badge'>Respostas 24h: <b>{throughput['replies_24h']}</b></span>
-    </div>
-    <div class='filters'>{dashboard_nav}</div>
-    <div class='filters'>{country_pills}</div>
-    <div class='filters'>{audience_pills}</div>
-  </section>
-
-  <section class='grid kpis'>
-    <div class='card'>
-      <div class='kpi-title'>Preco Atual</div>
-      <div class='kpi-value'>R$ {pricing['price_full']} / R$ {pricing['price_simple']}</div>
-      <div class='price-row'>
-        <span class='pill'>Nivel {pricing['price_level']}</span>
-        <span class='pill'>Baseline {baseline_txt}</span>
+  <div class='page'>
+    <header class='topbar'>
+      <div class='chip-row'>
+        <span class='chip {safe_class}'>Sistema: <b>{safe_mode}</b></span>
+        <span class='chip {activity_class}'>Ultima atividade: <b>{activity_txt}</b></span>
+        <span class='chip is-neutral'>Escopo: <b>{_safe(current_scope)}</b></span>
+        <span class='chip is-neutral'>Fluxo: <b>{_safe(dashboard_badge)}</b></span>
+        <span class='chip {queue_class}'>Fila Codex: <b>{queue_backlog}</b></span>
       </div>
-    </div>
-    <div class='card'>
-      <div class='kpi-title'>Conversao 7d</div>
-      <div class='kpi-value'>{conv_txt}</div>
-      <div class='muted'>Vendas: {funnel['won_7d']} | Ofertas: {funnel['offers_7d']}</div>
-    </div>
-    <div class='card'>
-      <div class='kpi-title'>Ofertas no Bloco</div>
-      <div class='kpi-value'>{pricing['offers_in_window']}/10</div>
-      <div class='progress'><i></i></div>
-    </div>
-    <div class='card'>
-      <div class='kpi-title'>Vendas 7d</div>
-      <div class='kpi-value'>{funnel['won_7d']}</div>
-      <div class='muted'>Tempo medio ate venda: {funnel['avg_days_to_win_7d']:.1f} dias</div>
-    </div>
-    <div class='card'>
-      <div class='kpi-title'>Receita Estimada 7d</div>
-      <div class='kpi-value'>R$ {funnel['revenue_estimated_7d']:.0f}</div>
-      <div class='muted'>Apenas vendas marcadas como WON</div>
-    </div>
-    <div class='card'>
-      <div class='kpi-title'>Fila Codex</div>
-      <div class='kpi-value'>{queue['counts']['pending'] + queue['counts']['review_required']}</div>
-      <div class='muted'>PENDENTE + REVISAO</div>
-    </div>
-  </section>
+      <button class='theme-toggle' id='themeToggle' type='button'>Alternar tema</button>
+    </header>
 
-  <section class='grid split' style='margin-top:10px'>
-    <div class='card'>
-      <h2>Funil Comercial (7 dias)</h2>
-      <div class='funnel'>{funnel_rows}</div>
-    </div>
-    <div class='card'>
-      <h2>Canal e Saude Operacional</h2>
-      <table>
-        <thead><tr><th>Canal</th><th>Status</th><th>Motivo</th></tr></thead>
-        <tbody>{channel_rows}</tbody>
-      </table>
-      <div class='muted' style='margin-top:8px'>
-        Entregues: {es['contact_delivered']} | Falhas: {es['contact_failed']} | Ofertas enviadas: {es['offer_sent']}
+    <section class='hero'>
+      <div class='hero-head'>
+        <div>
+          <h1>{_safe(dashboard_title)}</h1>
+          <div class='subtitle'>Atualizado em {_safe(snap['generated_at_utc'])} (UTC){_safe(scope_suffix)}. Refresco automatico a cada 10 segundos.</div>
+        </div>
+        <div class='chip-row'>
+          <span class='chip is-neutral'>Abordagens 1h: <b>{throughput['touches_1h_total']}</b></span>
+          <span class='chip is-neutral'>Abordagens 24h: <b>{throughput['touches_24h_total']}</b></span>
+          <span class='chip is-neutral'>Leads 24h: <b>{throughput['new_leads_24h']}</b></span>
+          <span class='chip is-neutral'>Respostas 24h: <b>{throughput['replies_24h']}</b></span>
+        </div>
       </div>
-    </div>
-  </section>
+      <div class='filters'>{dashboard_nav}</div>
+      <div class='filters'>{country_pills}</div>
+      <div class='filters'>{audience_pills}</div>
+    </section>
 
-  <section class='card' style='margin-top:10px'>
-    <h2>Ritmo por Canal (1h vs 24h)</h2>
-    <table>
-      <thead><tr><th>Canal</th><th>1h</th><th>24h</th><th>Volume 24h</th><th>Intensidade 1h</th></tr></thead>
-      <tbody>{pace_rows}</tbody>
-    </table>
-  </section>
+    <section class='alerts'>{alert_rows}</section>
 
-  <section class='grid split' style='margin-top:10px'>
-    <div class='card'>
-      <h2>Performance por Template (Email)</h2>
-      <table>
-        <thead><tr><th>Template</th><th>Envios</th><th>Leads</th><th>Com resposta</th><th>Taxa</th></tr></thead>
-        <tbody>{template_rows}</tbody>
-      </table>
-    </div>
-    <div class='card'>
-      <h2>A/B Fluxo 2 (Handoff)</h2>
-      <div class='muted'>Split por coorte do lead (A/B deterministico). Eventos de atribuicao: {es['ab_variant_assigned']}</div>
-      <table>
-        <thead><tr><th>Variante</th><th>Envios</th><th>Respostas</th><th>Taxa</th></tr></thead>
-        <tbody>{ab_rows}</tbody>
-      </table>
-    </div>
-  </section>
+    <section class='kpi-grid'>
+      <article class='card'>
+        <div class='kpi-label'>Preco atual</div>
+        <div class='kpi-value'>R$ {pricing['price_full']} / R$ {pricing['price_simple']}</div>
+        <div class='pill-row'>
+          <span class='pill'>Nivel {pricing['price_level']}</span>
+          <span class='pill'>Baseline {baseline_txt}</span>
+        </div>
+      </article>
+      <article class='card'>
+        <div class='kpi-label'>Conversao 7d</div>
+        <div class='kpi-value'>{conv_txt}</div>
+        <div class='kpi-foot'>Vendas: {funnel['won_7d']} | Ofertas: {funnel['offers_7d']}</div>
+      </article>
+      <article class='card'>
+        <div class='kpi-label'>Bloco de preco</div>
+        <div class='kpi-value'>{pricing['offers_in_window']}/10</div>
+        <div class='progress'><i></i></div>
+        <div class='kpi-foot'>Progresso para decisao do proximo degrau.</div>
+      </article>
+      <article class='card'>
+        <div class='kpi-label'>Vendas em 7 dias</div>
+        <div class='kpi-value'>{funnel['won_7d']}</div>
+        <div class='kpi-foot'>Tempo medio ate venda: {funnel['avg_days_to_win_7d']:.1f} dias</div>
+      </article>
+      <article class='card'>
+        <div class='kpi-label'>Receita estimada 7d</div>
+        <div class='kpi-value'>R$ {funnel['revenue_estimated_7d']:.0f}</div>
+        <div class='kpi-foot'>Somente oportunidades marcadas como WON.</div>
+      </article>
+      <article class='card'>
+        <div class='kpi-label'>Revisao Codex</div>
+        <div class='kpi-value'>{queue_backlog}</div>
+        <div class='pill-row'>
+          <span class='pill'>Pendente: {queue['counts']['pending']}</span>
+          <span class='pill'>Revisao: {queue['counts']['review_required']}</span>
+        </div>
+        <div class='kpi-foot'>{queue_label}</div>
+      </article>
+    </section>
 
-  <section class='grid split' style='margin-top:10px'>
-    <div class='card'>
-      <h2>Leads por Pais</h2>
-      <table>
-        <thead><tr><th>Pais</th><th>Leads</th><th>Participacao</th></tr></thead>
-        <tbody>{country_rows}</tbody>
-      </table>
-    </div>
-    <div class='card'>
-      <h2>Abordagens por Canal</h2>
-      <table>
-        <thead><tr><th>Canal</th><th>Total de abordagens</th><th>Volume relativo</th></tr></thead>
-        <tbody>{approach_channel_rows}</tbody>
-      </table>
-    </div>
-  </section>
+    <section class='main-layout'>
+      <div>
+        <article class='card' style='margin-bottom:10px;'>
+          <h2 class='card-title'>Funil Comercial (7 dias)</h2>
+          <div class='funnel-stack'>{funnel_rows}</div>
+          <div class='legend'>
+            <span class='chip is-neutral'>Leads: {funnel['leads_7d']}</span>
+            <span class='chip is-neutral'>Consentidos: {funnel['consented_7d']}</span>
+            <span class='chip is-neutral'>Ofertas: {funnel['offers_7d']}</span>
+            <span class='chip is-ok'>Vendas: {funnel['won_7d']}</span>
+            <span class='chip is-warn'>Perdidos: {funnel['lost_7d']}</span>
+          </div>
+        </article>
 
-  <section class='card' style='margin-top:10px'>
-    <h2>Abordagens por Pais x Canal</h2>
-    <table class='compact'>
-      <thead><tr><th>Pais</th><th>Canal</th><th>Abordagens</th><th>Forca</th></tr></thead>
-      <tbody>{approach_country_channel_rows}</tbody>
-    </table>
-  </section>
+        <article class='card' style='margin-bottom:10px;'>
+          <h2 class='card-title'>Ritmo por Canal (1h x 24h)</h2>
+          <div class='scroll-table'>
+            <table>
+              <thead><tr><th>Canal</th><th>1h</th><th>24h</th><th>Volume 24h</th><th>Intensidade 1h</th></tr></thead>
+              <tbody>{pace_rows}</tbody>
+            </table>
+          </div>
+        </article>
 
-  <section class='grid triple' style='margin-top:10px'>
-    <div class='card'>
-      <h2>Revisao Codex Pendente</h2>
-      <table>
-        <thead><tr><th>ID</th><th>Lead</th><th>Recebido</th><th>Mensagem</th></tr></thead>
-        <tbody>{pending_rows}</tbody>
-      </table>
-    </div>
-    <div class='card'>
-      <h2>Dominios em Implantacao</h2>
-      <div class='muted'>Total jobs: {domains['total_jobs']} | Em andamento: {domains['in_progress']}</div>
-      <table>
-        <thead><tr><th>Job</th><th>Dominio</th><th>Status</th><th>Dias</th></tr></thead>
-        <tbody>{domain_rows}</tbody>
-      </table>
-    </div>
-    <div class='card'>
-      <h2>Timeline Recente</h2>
-      <table>
-        <thead><tr><th>UTC</th><th>Evento</th><th>Payload</th></tr></thead>
-        <tbody>{event_rows}</tbody>
-      </table>
-    </div>
-  </section>
-</div>
+        <article class='card'>
+          <h2 class='card-title'>Performance por Template (Email)</h2>
+          <div class='scroll-table'>
+            <table>
+              <thead><tr><th>Template</th><th>Envios</th><th>Leads</th><th>Respostas</th><th>Taxa</th><th>Tendencia</th></tr></thead>
+              <tbody>{template_rows}</tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+
+      <aside class='aside-stack'>
+        <article class='card'>
+          <h2 class='card-title'>Saude Operacional</h2>
+          <div class='scroll-table'>
+            <table>
+              <thead><tr><th>Canal</th><th>Status</th><th>Motivo</th></tr></thead>
+              <tbody>{channel_rows}</tbody>
+            </table>
+          </div>
+          <div class='muted' style='margin-top:8px;'>
+            Entregues: {es['contact_delivered']} | Falhas: {es['contact_failed']} | Ofertas: {es['offer_sent']} | Sales: {es['sale_marked']}
+          </div>
+        </article>
+
+        <article class='card'>
+          <h2 class='card-title'>Revisao Codex pendente</h2>
+          <div class='scroll-table'>
+            <table>
+              <thead><tr><th>ID</th><th>Lead</th><th>Recebido</th><th>Mensagem</th></tr></thead>
+              <tbody>{pending_rows}</tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class='card'>
+          <h2 class='card-title'>Dominios em implantacao</h2>
+          <div class='muted'>Total jobs: {domains['total_jobs']} | Em andamento: {domains['in_progress']}</div>
+          <div class='scroll-table' style='margin-top:8px; max-height:280px;'>
+            <table>
+              <thead><tr><th>Job</th><th>Dominio</th><th>Status</th><th>Dias</th></tr></thead>
+              <tbody>{domain_rows}</tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class='card'>
+          <h2 class='card-title'>Timeline recente</h2>
+          <div class='event-feed'>{event_feed}</div>
+        </article>
+      </aside>
+    </section>
+
+    <section class='sub-grid'>
+      <article class='card'>
+        <h2 class='card-title'>Leads por Pais</h2>
+        <div class='scroll-table'>
+          <table>
+            <thead><tr><th>Pais</th><th>Leads</th><th>%</th><th>Participacao</th></tr></thead>
+            <tbody>{country_rows}</tbody>
+          </table>
+        </div>
+      </article>
+      <article class='card'>
+        <h2 class='card-title'>Abordagens por Canal</h2>
+        <div class='scroll-table'>
+          <table>
+            <thead><tr><th>Canal</th><th>Abordagens</th><th>Volume relativo</th></tr></thead>
+            <tbody>{approach_channel_rows}</tbody>
+          </table>
+        </div>
+      </article>
+      <article class='card'>
+        <h2 class='card-title'>A/B Fluxo 2 (Handoff)</h2>
+        <div class='muted'>Variantes atribuídas: {es['ab_variant_assigned']}</div>
+        <div class='scroll-table' style='margin-top:8px; max-height:240px;'>
+          <table>
+            <thead><tr><th>Variante</th><th>Envios</th><th>Respostas</th><th>Taxa</th></tr></thead>
+            <tbody>{ab_rows}</tbody>
+          </table>
+        </div>
+      </article>
+      <article class='card'>
+        <h2 class='card-title'>Abordagens por Pais x Canal</h2>
+        <div class='scroll-table'>
+          <table>
+            <thead><tr><th>Pais</th><th>Canal</th><th>Abordagens</th><th>Forca</th></tr></thead>
+            <tbody>{approach_country_channel_rows}</tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+  </div>
+  <script>
+    (function() {{
+      var root = document.documentElement;
+      var btn = document.getElementById('themeToggle');
+      var stored = localStorage.getItem('leadgen_theme');
+      if (!stored) {{
+        stored = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }}
+      root.setAttribute('data-theme', stored);
+      btn.textContent = stored === 'dark' ? 'Tema claro' : 'Tema escuro';
+      btn.addEventListener('click', function() {{
+        var current = root.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+        var next = current === 'dark' ? 'light' : 'dark';
+        root.setAttribute('data-theme', next);
+        localStorage.setItem('leadgen_theme', next);
+        btn.textContent = next === 'dark' ? 'Tema claro' : 'Tema escuro';
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
 
