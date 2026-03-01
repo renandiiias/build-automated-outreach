@@ -933,7 +933,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         for ch in pace_channels
     ) or "<tr><td colspan='5'>Sem ritmo por canal ainda.</td></tr>"
 
-    max_reply_rate = max([float(it["reply_rate"]) for it in template_perf["rows"]] or [0.01])
+    max_reply_rate = max(max([float(it["reply_rate"]) for it in template_perf["rows"]] or [0.0]), 0.01)
     template_rows = "".join(
         (
             f"<tr class='{'is-row-highlight' if float(it['reply_rate']) >= 0.08 else ''}'>"
