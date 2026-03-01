@@ -134,13 +134,43 @@ def _location_hint(value: str, locale: str) -> str:
     }
     filtered = [p for p in parts if p.lower() not in country_words]
     parts = filtered or parts
-    if len(parts) >= 3:
-        candidate = parts[-2] if parts[-1].lower() in {"faro", "lisboa", "lisbon", "porto", "madrid", "catalunya", "barcelona"} else parts[-1]
-        return candidate
-    if len(parts) == 2:
-        candidate = parts[-1]
-        return candidate
-    return parts[0]
+    # Prioriza cidade legível e ignora CEP/ZIP ou trecho de rua.
+    postal_patterns = [
+        re.compile(r"^\d{5}-?\d{3}$"),                 # BR CEP
+        re.compile(r"^\d{5}(?:-\d{4})?$"),             # US ZIP
+        re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$", re.I),  # UK postcode
+    ]
+    street_tokens = {
+        "rua", "av", "avenida", "travessa", "alameda", "rodovia", "estrada",
+        "street", "st", "road", "rd", "avenue", "ave", "blvd", "drive", "dr",
+        "calle", "carrer", "plaza", "piazza",
+    }
+
+    def _score(part: str) -> int:
+        p = (part or "").strip()
+        low = p.lower()
+        letters = len(re.findall(r"[a-zA-ZÀ-ÿ]", p))
+        digits = len(re.findall(r"\d", p))
+        if not p:
+            return -99
+        if any(rx.match(p) for rx in postal_patterns):
+            return -50
+        score = 0
+        if letters > 0:
+            score += 4
+        if digits > 0:
+            score -= 2
+        if digits >= letters and digits > 0:
+            score -= 2
+        if any(tok in low for tok in street_tokens):
+            score -= 2
+        if len(p) <= 2:
+            score -= 2
+        return score
+
+    ranked = sorted(parts, key=lambda p: (_score(p), parts.index(p)), reverse=True)
+    best = ranked[0] if ranked else parts[-1]
+    return best
 
 
 def _identity_service_label(service_hint: str, locale: str) -> str:
