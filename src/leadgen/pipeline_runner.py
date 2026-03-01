@@ -741,6 +741,10 @@ class LeadPipelineRunner:
             return "pt-BR"
         if re.search(r"\b(sp|rj|mg|ba|ce|pr|rs|sc|go|df)\b", addr):
             return "pt-BR"
+        if digits.startswith("34"):
+            return "es"
+        if any(tok in addr for tok in ["spain", "españa", "espana", "madrid", "barcelona", "valencia", "sevilla"]):
+            return "es"
         return "en"
 
     @staticmethod
@@ -754,6 +758,8 @@ class LeadPipelineRunner:
             return "UK"
         if any(token in lowered for token in ["united states", "usa", "new york", "miami", "florida"]):
             return "US"
+        if any(token in lowered for token in ["spain", "españa", "espana", "madrid", "barcelona", "valencia", "sevilla"]):
+            return "ES"
         return ""
 
     @staticmethod

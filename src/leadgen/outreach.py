@@ -114,6 +114,10 @@ def _is_pt_br(locale: str) -> bool:
     return (locale or "").strip().lower().startswith("pt")
 
 
+def _is_spanish(locale: str) -> bool:
+    return (locale or "").strip().lower().startswith("es")
+
+
 def _money(amount: int, currency_code: str, locale: str) -> str:
     if _is_pt_br(locale):
         return f"R$ {amount}"
@@ -134,6 +138,8 @@ def initial_consent_email(
     _ = variant
     if _is_pt_br(locale):
         subject = f"{name}: posso te enviar uma ideia gratuita da sua pagina?"
+    elif _is_spanish(locale):
+        subject = f"{name}: puedo enviarte una idea gratuita para tu web?"
     else:
         subject = f"{name}: can I send you a free homepage concept?"
     city_hint = city.strip() or "your area"
@@ -150,6 +156,21 @@ def initial_consent_email(
             f"{positioning}"
             "Posso montar uma versao conceito gratuita e te enviar hoje, sem compromisso.\n\n"
             "Se nao quiser mais mensagens, descadastre aqui: "
+            f"{unsubscribe_url}"
+        )
+    elif _is_spanish(locale):
+        city_hint = city.strip() or "tu zona"
+        positioning = (
+            "Vi su web actual y puedo crear una version mucho mas impactante para generar mas consultas.\n\n"
+            if has_website
+            else "Vi una oportunidad clara para convertir mas visitas en mensajes y llamadas.\n\n"
+        )
+        body = (
+            f"Hola, equipo de {name}.\n\n"
+            f"Encontré su ficha en Google en {city_hint}. "
+            f"{positioning}"
+            "Puedo montar una version concepto gratuita y enviarla hoy, sin compromiso.\n\n"
+            "Si no quieren mas mensajes, pueden salir aqui: "
             f"{unsubscribe_url}"
         )
     else:
@@ -184,6 +205,14 @@ def identity_probe_email(
             f"Oi, por acaso esse e-mail e da equipe {name}?\n\n"
             f"Pesquisei no Google por {service_text} em {city_text} e encontrei esse contato aqui."
         )
+    elif _is_spanish(locale):
+        service_text = (service_hint or "servicios como el de ustedes").strip()
+        city_text = (city or "esta zona").strip()
+        subject = f"por casualidad este correo es del equipo de {name}?"
+        body = (
+            f"Hola, por casualidad este correo es del equipo de {name}?\n\n"
+            f"Estaba buscando en Google {service_text} en {city_text} y encontré este contacto."
+        )
     else:
         service_text = (service_hint or "businesses like yours").strip()
         subject = f"is this the right email for {name}?"
@@ -205,6 +234,16 @@ def initial_consent_whatsapp(name: str, has_website: bool = False, locale: str =
             f"Oi {name}! {pitch} "
             "Quer que eu te envie uma ideia gratuita? Responde SIM. Para parar, responde PARAR."
         )
+    if _is_spanish(locale):
+        pitch = (
+            "Vi su sitio actual y puedo hacer una version mucho mas impactante para conversion."
+            if has_website
+            else "Vi su ficha en Google y puedo preparar una pagina de alta conversion."
+        )
+        return (
+            f"Hola {name}. {pitch} "
+            "Si quiere, le envio una idea gratuita. Responda SI. Para parar, responda STOP."
+        )
     pitch = (
         "I saw your current website and I can build a way more impactful version for conversions."
         if has_website
@@ -225,6 +264,8 @@ def followup_consent_email(
 ) -> tuple[str, str, str]:
     if _is_pt_br(locale):
         subject = f"{name}: 3 ajustes rapidos para gerar mais contatos"
+    elif _is_spanish(locale):
+        subject = f"{name}: 3 ajustes rapidos para generar mas contactos"
     else:
         subject = f"{name}: 3 fast upgrades to get more enquiries"
     first_line = (
@@ -248,6 +289,22 @@ def followup_consent_email(
             "Opt-out: "
             f"{unsubscribe_url}"
         )
+    elif _is_spanish(locale):
+        first_line = (
+            "Como ya tienen web, estos ajustes buscan subir la conversion sin complicar nada:\n\n"
+            if has_website
+            else "Aqui van 3 ajustes simples que suelen aumentar los contactos locales:\n\n"
+        )
+        body = (
+            f"Hola, equipo de {name}.\n\n"
+            f"{first_line}"
+            "1) Titulo claro con servicio + zona en la parte superior.\n"
+            "2) CTA fuerte en la primera pantalla.\n"
+            "3) Prueba local (reseñas, barrios atendidos, tiempo de respuesta).\n\n"
+            "Si le sirve, le envio hoy mismo un concepto gratuito con esto aplicado.\n\n"
+            "Salir: "
+            f"{unsubscribe_url}"
+        )
     else:
         body = (
             f"Hi {name} team,\n\n"
@@ -268,6 +325,16 @@ def followup_consent_email(
                 "Se quiser, te envio hoje.\n"
                 "Se nao for o momento, eu encerro por aqui.\n\n"
                 "Opt-out: "
+                f"{unsubscribe_url}"
+            )
+        elif _is_spanish(locale):
+            subject = f"{name}: cierro este tema por aqui?"
+            body = (
+                f"Hola, equipo de {name}.\n\n"
+                "Este es mi ultimo seguimiento sobre el concepto gratuito.\n\n"
+                "Si lo quieren, se los envio hoy.\n"
+                "Si ahora no es prioridad, cierro aqui sin problema.\n\n"
+                "Salir: "
                 f"{unsubscribe_url}"
             )
         else:
@@ -294,6 +361,16 @@ def followup_consent_whatsapp(name: str, step: int, has_website: bool = False, l
         return (
             f"{name}, ainda tem interesse em receber o conceito gratuito? "
             "Posso preparar hoje. Para parar mensagens, responde PARAR."
+        )
+    if _is_spanish(locale):
+        if step >= 2:
+            return (
+                f"{name}, ultimo toque sobre el concepto gratuito. "
+                "Si le interesa, responda SI y se lo envio hoy. Para parar, responda STOP."
+            )
+        return (
+            f"{name}, sigue interesado en recibir el concepto gratuito? "
+            "Lo puedo preparar hoy. Para parar mensajes, responda STOP."
         )
     if step >= 2:
         return (
@@ -322,6 +399,8 @@ def offer_email(
     subject = f"{name}: concept ready + 2 options"
     if _is_pt_br(locale):
         subject = f"{name}: conceito pronto + 2 opcoes"
+    elif _is_spanish(locale):
+        subject = f"{name}: concepto listo + 2 opciones"
     payment_block = ""
     if payment_url_full.strip() or payment_url_simple.strip():
         payment_block = (
@@ -351,6 +430,25 @@ def offer_email(
             "Se quiser seguir, responde \"COMPLETO\" ou \"SIMPLES\" que eu publico em seguida."
             f"{payment_block}\n\n"
             "Opt-out: "
+            f"{unsubscribe_url}"
+        )
+    elif _is_spanish(locale):
+        framing = (
+            "Lo armé como una version mas fuerte y enfocada en conversion de su web actual."
+            if has_website
+            else "Lo armé para darle una presencia digital clara y convertir mejor."
+        )
+        body = (
+            f"Perfecto, equipo de {name}.\n\n"
+            f"Su concepto ya está listo:\n{preview_url}\n\n"
+            f"{framing}\n\n"
+            "Propuesta:\n\n"
+            f"Completo: {_money(price_full, currency_code, locale)}\n"
+            f"Simple: {_money(price_simple, currency_code, locale)}\n\n"
+            "Los dos incluyen publicación y 1 año online.\n\n"
+            "Si quieren seguir, respondan \"COMPLETO\" o \"SIMPLE\" y lo publico enseguida."
+            f"{payment_block}\n\n"
+            "Salir: "
             f"{unsubscribe_url}"
         )
     else:
@@ -395,6 +493,15 @@ def offer_followup_email(
                 "Opt-out: "
                 f"{unsubscribe_url}"
             )
+        elif _is_spanish(locale):
+            subject = f"{name}: quiere que lo publique hoy?"
+            body = (
+                f"Hola, equipo de {name}.\n\n"
+                "Puedo publicar la version final hoy.\n"
+                "Respondan con \"COMPLETO\" o \"SIMPLE\" y lo ejecuto enseguida.\n\n"
+                "Salir: "
+                f"{unsubscribe_url}"
+            )
         else:
             subject = f"{name}: want me to publish today?"
             body = (
@@ -413,6 +520,16 @@ def offer_followup_email(
                 "Se quiser publicar, responde \"COMPLETO\" ou \"SIMPLES\" ate o fim do dia.\n\n"
                 "Se nao for o momento, sem problema, eu encerro por aqui.\n\n"
                 "Opt-out: "
+                f"{unsubscribe_url}"
+            )
+        elif _is_spanish(locale):
+            subject = f"{name}: lo cerramos hoy?"
+            body = (
+                f"Hola, equipo de {name}.\n\n"
+                "Cierro este ciclo hoy para no insistir de más.\n"
+                "Si quieren publicar, respondan \"COMPLETO\" o \"SIMPLE\" antes de terminar el día.\n\n"
+                "Si ahora no es el momento, no pasa nada, lo cierro aquí.\n\n"
+                "Salir: "
                 f"{unsubscribe_url}"
             )
         else:
@@ -450,6 +567,19 @@ def offer_whatsapp(
             f"Opcoes para publicar hoje:\n- COMPLETO ({_money(price_full, currency_code, locale)})\n- SIMPLES ({_money(price_simple, currency_code, locale)})\n\n"
             f"Quer o link de pagamento agora? {payment_url}\n\n"
             "Para parar mensagens, responda PARAR."
+        )
+    if _is_spanish(locale):
+        framing = (
+            "Hice este concepto como una mejora de conversion de su sitio actual."
+            if has_website
+            else "Hice este concepto para destacar su negocio y convertir mejor."
+        )
+        return (
+            f"{name}, su concepto ya está listo: {preview_url}\n\n"
+            f"{framing}\n\n"
+            f"Opciones para publicarlo hoy:\n- COMPLETO ({_money(price_full, currency_code, locale)})\n- SIMPLE ({_money(price_simple, currency_code, locale)})\n\n"
+            f"Si quiere, le mando el link de pago ahora: {payment_url}\n\n"
+            "Para parar mensajes, responda STOP."
         )
     framing = (
         "I built this as a stronger conversion-focused upgrade to your current site."
@@ -503,12 +633,56 @@ def classify_reply(text: str) -> tuple[str, float]:
     return "neutral", 0.5
 
 
-def classify_identity_reply(text: str) -> tuple[str, float]:
+def classify_identity_reply(text: str, from_email: str = "", from_raw: str = "") -> tuple[str, float]:
     t = (text or "").strip().lower()
     compact = re.sub(r"\s+", " ", t)
+    sender = f"{from_email} {from_raw}".strip().lower()
+    def contains_any(text_value: str, phrases: list[str]) -> bool:
+        return any(phrase in text_value for phrase in phrases)
+
+    def contains_word(text_value: str, word: str) -> bool:
+        return re.search(rf"\\b{re.escape(word)}\\b", text_value) is not None
+
+    auto_tokens = [
+        "automatic reply",
+        "auto reply",
+        "autoresponder",
+        "out of office",
+        "i am away",
+        "vacation",
+        "thank you for your email",
+        "resposta automatica",
+        "resposta automática",
+        "fora do escritorio",
+        "fora do escritório",
+        "autorespuesta",
+        "respuesta automatica",
+        "respuesta automática",
+        "fuera de la oficina",
+    ]
+    shared_tokens = [
+        "shared inbox",
+        "shared mailbox",
+        "team inbox",
+        "group inbox",
+        "this mailbox is monitored by",
+        "this email is managed by",
+        "varias personas",
+        "varios miembros",
+        "caixa compartilhada",
+        "esse e-mail e compartilhado",
+        "este correo lo revisamos",
+        "revisamos este correo entre",
+        "several of us",
+        "we all monitor",
+        "sales team",
+        "booking team",
+    ]
     yes_tokens = [
         "sim",
         "yes",
+        "si",
+        "sí",
         "this is",
         "speaking",
         "sou eu",
@@ -519,11 +693,12 @@ def classify_identity_reply(text: str) -> tuple[str, float]:
         "correct",
         "that is us",
         "this is the right email",
+        "soy yo",
+        "si, somos nosotros",
+        "sí, somos nosotros",
+        "este es el correo correcto",
     ]
-    no_tokens = [
-        "nao",
-        "não",
-        "no",
+    no_phrases = [
         "wrong email",
         "wrong person",
         "not me",
@@ -532,14 +707,32 @@ def classify_identity_reply(text: str) -> tuple[str, float]:
         "não sou",
         "email errado",
         "contato errado",
+        "correo equivocado",
+        "correo incorrecto",
+        "persona equivocada",
+        "este no es",
+        "este não é",
+        "esse nao e",
+        "esse não é",
     ]
-    if any(token in compact for token in no_tokens):
+    if contains_any(compact, auto_tokens):
+        return "auto_reply", 0.98
+    if contains_any(compact, shared_tokens):
+        return "shared_inbox", 0.82
+    if any(prefix in sender for prefix in ["info@", "hello@", "contact@", "sales@", "booking@", "reservas@", "comercial@"]):
+        if contains_any(compact, ["correct", "this is", "somos", "podem falar", "pueden hablar"]) or any(
+            contains_word(compact, short) for short in ["sim", "si", "sí", "yes"]
+        ):
+            return "shared_inbox", 0.7
+    if contains_any(compact, no_phrases) or any(contains_word(compact, short) for short in ["nao", "não", "no"]):
         return "negative", 0.92
-    if any(token in compact for token in yes_tokens):
+    if contains_any(compact, [token for token in yes_tokens if len(token) > 3]) or any(
+        contains_word(compact, short) for short in ["sim", "si", "sí", "yes"]
+    ):
         return "positive", 0.9
-    if compact in {"ok", "okay", "certo", "quem fala?", "who is this?"}:
-        return "unclear", 0.45
-    return "unclear", 0.3
+    if compact in {"ok", "okay", "certo", "quem fala?", "who is this?", "quien habla?", "quién habla?"}:
+        return "ambiguous_human", 0.45
+    return "ambiguous_human", 0.3
 
 
 def detect_plan_choice(text: str) -> str:

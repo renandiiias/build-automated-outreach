@@ -30,7 +30,7 @@ def _parse_utc(value: str) -> datetime | None:
 
 def _normalize_country_filter(value: str) -> str:
     raw = (value or "ALL").strip().upper()
-    return raw if raw in {"ALL", "BR", "NON_BR", "PT", "UK", "US"} else "ALL"
+    return raw if raw in {"ALL", "BR", "NON_BR", "PT", "UK", "US", "ES"} else "ALL"
 
 
 def _normalize_audience_filter(value: str) -> str:
@@ -124,7 +124,7 @@ def _db_counts(db_path: Path, country_filter: str = "ALL", audience_filter: str 
 
 def _derive_country(phone: str, address: str, country_code: str = "") -> str:
     normalized = (country_code or "").strip().upper()
-    if normalized in {"BR", "PT", "UK", "US"}:
+    if normalized in {"BR", "PT", "UK", "US", "ES"}:
         return normalized
     if normalized == "NON_BR":
         return "OTHER"
@@ -138,6 +138,8 @@ def _derive_country(phone: str, address: str, country_code: str = "") -> str:
         return "UK"
     if phone_s.startswith("+1") or "united states" in address_l or "usa" in address_l or "new york" in address_l or "miami" in address_l:
         return "US"
+    if phone_s.startswith("+34") or "spain" in address_l or "españa" in address_l or "espana" in address_l or "madrid" in address_l or "barcelona" in address_l:
+        return "ES"
     if not phone_s and not address_l:
         return "UNKNOWN"
     return "OTHER"
@@ -727,6 +729,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         "PT": "Portugal",
         "UK": "Reino Unido",
         "US": "USA",
+        "ES": "Espanha",
     }.get(selected_country, "Geral")
     dashboard_title = "Painel Comercial LeadGenerator"
     dashboard_badge = "Fluxo 1"
@@ -800,6 +803,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         ("PT", "Portugal"),
         ("UK", "Reino Unido"),
         ("US", "USA"),
+        ("ES", "Espanha"),
     ]
     country_pills = "".join(
         (

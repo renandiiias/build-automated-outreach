@@ -56,6 +56,8 @@ def _infer_country_code(phone: str, address: str) -> str:
         return "UK"
     if digits.startswith("1") or any(token in addr for token in [" united states", " usa", " miami", " new york", " florida"]):
         return "US"
+    if digits.startswith("34") or any(token in addr for token in [" spain", " espana", " españa", " madrid", " barcelona", " valencia", " sevilla"]):
+        return "ES"
     return ""
 
 

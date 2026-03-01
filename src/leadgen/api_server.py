@@ -228,7 +228,7 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         lead_id = int(lead_ctx["id"])
 
         if lead_ctx.get("approach_version") == "v2_identity_probe" and lead_ctx.get("stage") == "VERIFY_WAITING":
-            decision, confidence = classify_identity_reply(text)
+            decision, confidence = classify_identity_reply(text, from_email=from_email, from_raw=from_raw)
             self.store.save_reply(lead_id, "EMAIL", text, f"identity_{decision}", confidence)
             self.logger.write(
                 "identity_reply_received",
@@ -243,6 +243,13 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
             if decision == "negative":
                 self.store.update_stage(lead_id, "IDENTITY_REJECTED")
                 self._send_json(202, {"ok": True, "matched": True, "queued": False, "lead_id": lead_id, "identity": "negative"})
+                return
+            if decision == "auto_reply":
+                self.logger.write(
+                    "identity_auto_reply_ignored",
+                    {"lead_id": lead_id, "channel": "EMAIL", "from": from_email},
+                )
+                self._send_json(202, {"ok": True, "matched": True, "queued": False, "lead_id": lead_id, "identity": "auto_reply"})
                 return
             if decision == "positive":
                 if not self.email_client:
@@ -284,6 +291,30 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(502, {"ok": False, "error": "handoff_send_failed", "detail": sent.detail, "lead_id": lead_id})
                 return
+            queue_id = self.store.enqueue_reply_review(lead_id=lead_id, channel="EMAIL", inbound_text=text)
+            self.logger.write(
+                "reply_queued_for_codex",
+                {
+                    "lead_id": lead_id,
+                    "queue_id": queue_id,
+                    "channel": "EMAIL",
+                    "from": from_email,
+                    "source": "identity_gate",
+                    "identity_decision": decision,
+                },
+            )
+            self._send_json(
+                202,
+                {
+                    "ok": True,
+                    "matched": True,
+                    "queued": True,
+                    "lead_id": lead_id,
+                    "queue_id": queue_id,
+                    "identity": decision,
+                },
+            )
+            return
 
         queue_id = self.store.enqueue_reply_review(lead_id=lead_id, channel="EMAIL", inbound_text=text)
         self.store.save_reply(lead_id, "EMAIL", text, "queued_for_codex", 0.0)
@@ -581,6 +612,10 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
             return "pt-BR"
         if re.search(r"\b(sp|rj|mg|ba|ce|pr|rs|sc|go|df)\b", addr):
             return "pt-BR"
+        if digits.startswith("34"):
+            return "es"
+        if any(tok in addr for tok in ["spain", "españa", "espana", "madrid", "barcelona", "valencia", "sevilla"]):
+            return "es"
         return "en"
 
 
