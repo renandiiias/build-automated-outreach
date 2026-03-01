@@ -118,6 +118,52 @@ def _is_spanish(locale: str) -> bool:
     return (locale or "").strip().lower().startswith("es")
 
 
+def _location_hint(value: str, locale: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        if _is_pt_br(locale):
+            return "sua cidade"
+        if _is_spanish(locale):
+            return "tu ciudad"
+        return "your city"
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return raw
+    country_words = {
+        "brazil", "brasil", "portugal", "united kingdom", "england", "usa", "united states", "spain", "espana", "españa"
+    }
+    filtered = [p for p in parts if p.lower() not in country_words]
+    parts = filtered or parts
+    if len(parts) >= 3:
+        candidate = parts[-2] if parts[-1].lower() in {"faro", "lisboa", "lisbon", "porto", "madrid", "catalunya", "barcelona"} else parts[-1]
+        return candidate
+    if len(parts) == 2:
+        candidate = parts[-1]
+        return candidate
+    return parts[0]
+
+
+def _identity_service_label(service_hint: str, locale: str) -> str:
+    raw = (service_hint or "").strip().lower()
+    if "hotel" in raw:
+        if _is_pt_br(locale):
+            return "hoteis"
+        if _is_spanish(locale):
+            return "hoteles"
+        return "hotels"
+    if "cowork" in raw:
+        if _is_pt_br(locale):
+            return "espacos de coworking"
+        if _is_spanish(locale):
+            return "espacios de coworking"
+        return "coworking spaces"
+    if _is_pt_br(locale):
+        return "negocios como o de voces"
+    if _is_spanish(locale):
+        return "negocios como el de ustedes"
+    return "businesses like yours"
+
+
 def _money(amount: int, currency_code: str, locale: str) -> str:
     if _is_pt_br(locale):
         return f"R$ {amount}"
@@ -197,8 +243,8 @@ def identity_probe_email(
     city: str = "",
     locale: str = "en",
 ) -> tuple[str, str, str]:
-    service_text = (service_hint or "servicos como o de voces").strip()
-    city_text = (city or "essa regiao").strip()
+    service_text = _identity_service_label(service_hint, locale)
+    city_text = _location_hint(city, locale)
     if _is_pt_br(locale):
         subject = f"por acaso esse e-mail e da equipe {name}?"
         body = (
@@ -206,15 +252,12 @@ def identity_probe_email(
             f"Pesquisei no Google por {service_text} em {city_text} e encontrei esse contato aqui."
         )
     elif _is_spanish(locale):
-        service_text = (service_hint or "servicios como el de ustedes").strip()
-        city_text = (city or "esta zona").strip()
         subject = f"por casualidad este correo es del equipo de {name}?"
         body = (
             f"Hola, por casualidad este correo es del equipo de {name}?\n\n"
             f"Estaba buscando en Google {service_text} en {city_text} y encontré este contacto."
         )
     else:
-        service_text = (service_hint or "businesses like yours").strip()
         subject = f"is this the right email for {name}?"
         body = (
             f"Hi, is this the right email for {name}?\n\n"

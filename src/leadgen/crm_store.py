@@ -548,6 +548,13 @@ class CrmStore:
             "approach_version": str(row[7] or "v1_legacy"),
         }
 
+    def get_lead_audience(self, lead_id: int) -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT audience FROM leads WHERE id=?", (lead_id,)).fetchone()
+        if not row:
+            return ""
+        return str(row[0] or "").strip()
+
     def get_preview_and_payment(self, lead_id: int) -> tuple[str, str]:
         with self._connect() as conn:
             row = conn.execute("SELECT preview_url, payment_url FROM leads WHERE id=?", (lead_id,)).fetchone()

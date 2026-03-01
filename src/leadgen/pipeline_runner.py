@@ -290,8 +290,10 @@ class LeadPipelineRunner:
                 continue
 
             locale = self._lead_locale(lead.phone, lead.address)
+            audience = self.store.get_lead_audience(lead.id)
             subject, body_text, html = identity_probe_email(
                 lead.business_name,
+                service_hint=audience,
                 city=lead.address,
                 locale=locale,
             )
@@ -737,8 +739,12 @@ class LeadPipelineRunner:
         addr = (address or "").lower()
         if digits.startswith("55"):
             return "pt-BR"
+        if digits.startswith("351"):
+            return "pt-PT"
         if any(tok in addr for tok in ["brasil", "brazil", "sao paulo", "rio de janeiro", "belo horizonte", "fortaleza", "salvador", "recife"]):
             return "pt-BR"
+        if any(tok in addr for tok in ["portugal", "lisbon", "lisboa", "porto", "portimao", "portimão", "faro", "coimbra", "braga"]):
+            return "pt-PT"
         if re.search(r"\b(sp|rj|mg|ba|ce|pr|rs|sc|go|df)\b", addr):
             return "pt-BR"
         if digits.startswith("34"):
