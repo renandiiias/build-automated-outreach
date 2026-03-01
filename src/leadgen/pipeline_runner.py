@@ -279,6 +279,12 @@ class LeadPipelineRunner:
             if self.store.is_opted_out(lead.email, "EMAIL"):
                 continue
             email_contact = (lead.email or "").strip().lower()
+            if not self._is_likely_real_email(email_contact):
+                self.logger.write(
+                    "lead_skipped",
+                    {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "invalid_email"},
+                )
+                continue
             if self.store.has_contact_been_sent(email_contact, "EMAIL", "IDENTITY_CHECK"):
                 self.logger.write(
                     "lead_skipped",
@@ -820,3 +826,39 @@ class LeadPipelineRunner:
                 "incident_report_generated",
                 {"run_id": run_id, "fingerprint": fingerprint, "level": state.level, "report_path": str(report)},
             )
+
+    @staticmethod
+    def _is_likely_real_email(value: str) -> bool:
+        email = (value or "").strip().lower()
+        if not email or "@" not in email:
+            return False
+        if any(ch in email for ch in ["/", "\\", "?", "#", " "]):
+            return False
+        if ".." in email:
+            return False
+        local, _, domain = email.partition("@")
+        if not local or not domain or "." not in domain:
+            return False
+        tld = domain.rsplit(".", 1)[-1].lower()
+        if tld in {
+            "png",
+            "jpg",
+            "jpeg",
+            "gif",
+            "webp",
+            "svg",
+            "bmp",
+            "ico",
+            "pdf",
+            "css",
+            "js",
+            "json",
+            "xml",
+            "txt",
+            "zip",
+            "rar",
+            "mp3",
+            "mp4",
+        }:
+            return False
+        return True

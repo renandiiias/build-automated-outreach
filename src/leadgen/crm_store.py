@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -9,6 +10,29 @@ from pathlib import Path
 from typing import Any
 
 from .time_utils import UTC
+
+
+_EMAIL_RX = re.compile(r"([A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24})")
+_BAD_EMAIL_TLDS = {
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "svg",
+    "bmp",
+    "ico",
+    "pdf",
+    "css",
+    "js",
+    "json",
+    "xml",
+    "txt",
+    "zip",
+    "rar",
+    "mp3",
+    "mp4",
+}
 
 
 def _price_base_full() -> int:
@@ -28,6 +52,32 @@ def _price_for_level(level: int) -> tuple[int, int]:
     base_simple = _price_base_simple()
     step = _price_step()
     return base_full + (level * step), base_simple + (level * step)
+
+
+def _is_likely_real_email(value: str) -> bool:
+    email = (value or "").strip().lower()
+    if not email or "@" not in email:
+        return False
+    if any(ch in email for ch in ["/", "\\", "?", "#", " "]):
+        return False
+    local, _, domain = email.partition("@")
+    if not local or not domain or "." not in domain:
+        return False
+    tld = domain.rsplit(".", 1)[-1].lower()
+    if tld in _BAD_EMAIL_TLDS:
+        return False
+    if ".." in email or local.startswith(".") or local.endswith(".") or domain.startswith(".") or domain.endswith("."):
+        return False
+    return True
+
+
+def _extract_first_valid_email(raw_value: str) -> str:
+    raw = str(raw_value or "").replace("mailto:", " ").replace(";", " ").replace(",", " ")
+    candidates = [m.group(1).strip().lower() for m in _EMAIL_RX.finditer(raw)]
+    for cand in candidates:
+        if _is_likely_real_email(cand):
+            return cand
+    return ""
 
 
 @dataclass
@@ -298,6 +348,17 @@ class CrmStore:
                 guessed = _infer_country_code(str(row[1] or ""), str(row[2] or ""))
                 if guessed:
                     conn.execute("UPDATE leads SET country_code=? WHERE id=?", (guessed, int(row[0])))
+        rows_email = conn.execute("SELECT id, email, phone FROM leads").fetchall()
+        for row in rows_email:
+            lead_id = int(row[0])
+            email = str(row[1] or "").strip().lower()
+            phone = str(row[2] or "").strip()
+            if email and not _is_likely_real_email(email):
+                preferred = "WHATSAPP" if phone else "NONE"
+                conn.execute(
+                    "UPDATE leads SET email='', channel_preferred=?, updated_at_utc=? WHERE id=?",
+                    (preferred, self._now().isoformat(), lead_id),
+                )
         if "approach_version" in {str(r[1]) for r in conn.execute("PRAGMA table_info(leads)").fetchall()}:
             conn.execute("UPDATE leads SET approach_version='v1_legacy' WHERE trim(COALESCE(approach_version, '')) = ''")
 
@@ -312,7 +373,7 @@ class CrmStore:
         now = self._now().isoformat()
         name = str(row.get("name", "")).strip()
         phone = str(row.get("phone", "")).strip()
-        email = str(row.get("website_emails", "")).split(",")[0].strip()
+        email = _extract_first_valid_email(str(row.get("website_emails", "") or row.get("email", "")))
         website = str(row.get("website", "")).strip()
         maps_url = str(row.get("maps_url", "")).strip()
         address = str(row.get("address", "")).strip()
