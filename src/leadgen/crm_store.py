@@ -322,6 +322,34 @@ class CrmStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lead_contact_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lead_id INTEGER NOT NULL,
+                    email TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    country_code TEXT NOT NULL,
+                    niche TEXT NOT NULL,
+                    validation_status TEXT NOT NULL,
+                    mx_ok INTEGER NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    created_at_utc TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS domain_mx_cache (
+                    domain TEXT PRIMARY KEY,
+                    mx_ok INTEGER NOT NULL,
+                    checked_at_utc TEXT NOT NULL,
+                    ttl_seconds INTEGER NOT NULL
+                )
+                """
+            )
             self._migrate_schema(conn)
             conn.commit()
 
@@ -373,7 +401,7 @@ class CrmStore:
         now = self._now().isoformat()
         name = str(row.get("name", "")).strip()
         phone = str(row.get("phone", "")).strip()
-        email = _extract_first_valid_email(str(row.get("website_emails", "") or row.get("email", "")))
+        email = _extract_first_valid_email(str(row.get("email", "") or row.get("website_emails", "")))
         website = str(row.get("website", "")).strip()
         maps_url = str(row.get("maps_url", "")).strip()
         address = str(row.get("address", "")).strip()
@@ -570,6 +598,82 @@ class CrmStore:
         if not row:
             return "", ""
         return str(row[0] or ""), str(row[1] or "")
+
+    def save_lead_contact_candidates(
+        self,
+        lead_id: int,
+        candidates: list[dict[str, Any]],
+        country_code: str = "",
+        niche: str = "",
+    ) -> None:
+        if not candidates:
+            return
+        ts = self._now().isoformat()
+        with self._connect() as conn:
+            for cand in candidates:
+                conn.execute(
+                    """
+                    INSERT INTO lead_contact_candidates
+                    (lead_id, email, source_type, source_name, source_url, country_code, niche, validation_status, mx_ok, confidence, created_at_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        lead_id,
+                        str(cand.get("email", "")).strip().lower(),
+                        str(cand.get("source_type", "")).strip(),
+                        str(cand.get("source_name", "")).strip(),
+                        str(cand.get("source_url", "")).strip(),
+                        str(country_code or "").strip().upper(),
+                        str(niche or "").strip(),
+                        str(cand.get("validation_status", "")).strip(),
+                        int(cand.get("mx_ok", 0) or 0),
+                        float(cand.get("confidence", 0.0) or 0.0),
+                        ts,
+                    ),
+                )
+            conn.commit()
+
+    def get_domain_mx_cache(self, domain: str, ttl_seconds: int = 86400) -> dict[str, Any] | None:
+        dom = str(domain or "").strip().lower()
+        if not dom:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT mx_ok, checked_at_utc, ttl_seconds FROM domain_mx_cache WHERE domain=?",
+                (dom,),
+            ).fetchone()
+        if not row:
+            return None
+        checked = str(row[1] or "")
+        if not checked:
+            return None
+        try:
+            checked_dt = datetime.fromisoformat(checked)
+        except Exception:
+            return None
+        effective_ttl = int(row[2] or ttl_seconds or 86400)
+        if (self._now() - checked_dt).total_seconds() > max(1, effective_ttl):
+            return None
+        return {"mx_ok": int(row[0] or 0), "checked_at_utc": checked, "ttl_seconds": effective_ttl}
+
+    def upsert_domain_mx_cache(self, domain: str, mx_ok: bool, ttl_seconds: int = 86400) -> None:
+        dom = str(domain or "").strip().lower()
+        if not dom:
+            return
+        ts = self._now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO domain_mx_cache(domain, mx_ok, checked_at_utc, ttl_seconds)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(domain) DO UPDATE SET
+                    mx_ok=excluded.mx_ok,
+                    checked_at_utc=excluded.checked_at_utc,
+                    ttl_seconds=excluded.ttl_seconds
+                """,
+                (dom, 1 if mx_ok else 0, ts, int(ttl_seconds or 86400)),
+            )
+            conn.commit()
 
     def get_lead_id_by_email(self, email: str) -> int | None:
         if not email:

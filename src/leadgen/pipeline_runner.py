@@ -146,8 +146,12 @@ class LeadPipelineRunner:
                 )
             )
             rows = result.rows
+            country_code = self._country_code_for_location(location)
+            for row in rows:
+                row["country_code"] = country_code
+                row["audience"] = audience
             if enrich_website:
-                rows = enrich_with_website_contacts(rows, self.logger, run_id)
+                rows = enrich_with_website_contacts(rows, self.logger, run_id, store=self.store)
 
             # International mode: keep all contactable businesses, including those with existing websites.
             rows_qualified = [
@@ -167,7 +171,6 @@ class LeadPipelineRunner:
             )
 
             leads_before = self.store.count_leads()
-            country_code = self._country_code_for_location(location)
             for row in rows_qualified:
                 lead_id = self.store.upsert_lead_from_row(
                     run_id,
@@ -176,6 +179,14 @@ class LeadPipelineRunner:
                     country_code=country_code,
                     approach_version="v2_identity_probe",
                 )
+                candidates = row.get("contact_candidates") if isinstance(row.get("contact_candidates"), list) else []
+                if candidates:
+                    self.store.save_lead_contact_candidates(
+                        lead_id=lead_id,
+                        candidates=candidates,
+                        country_code=country_code,
+                        niche=audience,
+                    )
                 self.store.update_stage(lead_id, "QUALIFIED")
                 self.logger.write(
                     "lead_qualified",
