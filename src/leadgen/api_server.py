@@ -14,6 +14,7 @@ from .monitor_dashboard import build_snapshot, render_dashboard_html
 from .outreach import (
     classify_codex_intent,
     classify_identity_reply,
+    detect_auto_reply_inbound,
     detect_plan_choice,
     get_resend_client_from_env,
     initial_consent_email,
@@ -212,6 +213,7 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
 
         from_raw = str(data.get("from") or data.get("from_email") or data.get("sender") or "").strip()
         from_email = self._extract_email(from_raw)
+        subject = str(data.get("subject") or data.get("email_subject") or "").strip()
         text = str(data.get("text") or data.get("text_body") or data.get("body") or "").strip()
         html = str(data.get("html") or data.get("html_body") or "").strip()
         if not text and html:
@@ -226,6 +228,31 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
             self._send_json(202, {"ok": True, "matched": False, "queued": False})
             return
         lead_id = int(lead_ctx["id"])
+
+        auto_reply, auto_reason = detect_auto_reply_inbound(text=text, subject=subject, payload=data)
+        if auto_reply:
+            self.store.save_reply(lead_id, "EMAIL", text, "auto_reply", 0.99)
+            self.logger.write(
+                "auto_reply_ignored",
+                {
+                    "lead_id": lead_id,
+                    "channel": "EMAIL",
+                    "from": from_email,
+                    "reason": auto_reason,
+                },
+            )
+            self._send_json(
+                202,
+                {
+                    "ok": True,
+                    "matched": True,
+                    "queued": False,
+                    "lead_id": lead_id,
+                    "auto_reply": True,
+                    "reason": auto_reason,
+                },
+            )
+            return
 
         if lead_ctx.get("approach_version") == "v2_identity_probe" and lead_ctx.get("stage") == "VERIFY_WAITING":
             decision, confidence = classify_identity_reply(text, from_email=from_email, from_raw=from_raw)

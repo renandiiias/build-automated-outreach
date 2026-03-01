@@ -837,6 +837,58 @@ def classify_identity_reply(text: str, from_email: str = "", from_raw: str = "")
     return "ambiguous_human", 0.3
 
 
+def detect_auto_reply_inbound(text: str, subject: str = "", payload: dict | None = None) -> tuple[bool, str]:
+    content = f"{subject or ''}\n{text or ''}".strip().lower()
+    auto_tokens = [
+        "automatic reply",
+        "auto reply",
+        "autoresponder",
+        "out of office",
+        "i am away",
+        "vacation",
+        "thank you for your email",
+        "resposta automatica",
+        "resposta automática",
+        "fora do escritorio",
+        "fora do escritório",
+        "autorespuesta",
+        "respuesta automatica",
+        "respuesta automática",
+        "fuera de la oficina",
+        "i'll be back",
+        "i will be back",
+        "não estou no escritório",
+        "nao estou no escritorio",
+    ]
+    for token in auto_tokens:
+        if token in content:
+            return True, f"token:{token}"
+
+    data = payload or {}
+    if isinstance(data, dict):
+        headers = data.get("headers") or data.get("email_headers") or {}
+        header_blob = ""
+        if isinstance(headers, dict):
+            header_blob = "\n".join(f"{k}:{v}" for k, v in headers.items()).lower()
+        elif isinstance(headers, list):
+            header_blob = "\n".join(str(x) for x in headers).lower()
+        raw_blob = f"{header_blob}\n{str(data.get('raw_headers') or '').lower()}"
+        header_tokens = [
+            "auto-submitted:auto-replied",
+            "x-autoreply",
+            "x-autorespond",
+            "x-auto-response-suppress",
+            "precedence: bulk",
+            "precedence: list",
+            "precedence: junk",
+        ]
+        for token in header_tokens:
+            if token in raw_blob:
+                return True, f"header:{token}"
+
+    return False, ""
+
+
 def detect_plan_choice(text: str) -> str:
     t = (text or "").strip().lower()
     if any(k in t for k in ["simple", "simples", "plano simples", "50", "100"]):
