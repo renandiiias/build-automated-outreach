@@ -206,14 +206,15 @@ def initial_consent_email(
         positioning = (
             "Vi o site atual de voces e consigo criar uma versao bem mais impactante para gerar mais contatos.\n\n"
             if has_website
-            else "Ela pode ser montada para destacar o servico, passar confianca rapido e facilitar o contato logo na primeira tela.\n\n"
+            else "Pra destacar o servico, passar confianca rapido e facilitar o contato logo na primeira tela.\n\n"
         )
         body = (
             f"Oi, equipe {name}.\n\n"
-            f"Encontrei a ficha de voces no Google em {city_hint} e vi uma oportunidade clara de transformar isso em mais pedidos de orcamento.\n\n"
+            f"Encontrei a ficha de voces no Google em {city_hint} e vi uma oportunidade clara de transformar isso em mais clientes pra voces.\n\n"
             "Eu consigo criar uma pagina de vendas para voces, com visual profissional, carregamento rapido e estrutura pensada para converter em mensagem, ligacao e WhatsApp.\n\n"
             f"{positioning}"
-            "Se quiser, eu monto uma versao gratuita para o negocio de voces e te envio hoje, sem compromisso.\n\n"
+            "Se quiser, eu monto uma versao gratuita inicialmente pra ver se gostam para o negocio de voces e te envio hoje, sem compromisso.\n\n"
+            "Se topar ver essa versao gratis, so me dizer um OK que eu ja te mando!\n\n"
             "Se nao quiser mais mensagens, descadastre aqui: "
             f"{unsubscribe_url}"
         )
