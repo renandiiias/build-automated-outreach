@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,7 +11,15 @@ from .config import get_config
 from .crm_store import CrmStore
 from .logging_utils import JsonlLogger
 from .monitor_dashboard import build_snapshot, render_dashboard_html
-from .outreach import classify_codex_intent, detect_plan_choice, get_resend_client_from_env, is_opt_out_reply
+from .outreach import (
+    classify_codex_intent,
+    classify_identity_reply,
+    detect_plan_choice,
+    get_resend_client_from_env,
+    initial_consent_email,
+    is_opt_out_reply,
+    build_unsubscribe_url,
+)
 from .payment import get_stripe_client_from_env
 from .time_utils import UTC
 
@@ -29,14 +38,25 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         country = ((query.get("country") or ["ALL"])[0] or "ALL").strip().upper()
         audience = ((query.get("audience") or ["ALL"])[0] or "ALL").strip()
+        approach = ((query.get("approach") or [""])[0] or "").strip().upper()
         if parsed.path == "/health":
             self._send_json(200, {"status": "ok"})
             return
         if parsed.path == "/api/status":
-            self._send_json(200, build_snapshot(country_filter=country, audience_filter=audience))
+            effective_approach = approach or "LEGACY"
+            self._send_json(200, build_snapshot(country_filter=country, audience_filter=audience, approach_filter=effective_approach))
+            return
+        if parsed.path == "/api/status2":
+            effective_approach = approach or "V2"
+            self._send_json(200, build_snapshot(country_filter=country, audience_filter=audience, approach_filter=effective_approach))
             return
         if parsed.path in {"/dashboard", "/"}:
-            self._send_html(200, render_dashboard_html(country_filter=country, audience_filter=audience))
+            effective_approach = approach or "LEGACY"
+            self._send_html(200, render_dashboard_html(country_filter=country, audience_filter=audience, approach_filter=effective_approach))
+            return
+        if parsed.path == "/dashboard2":
+            effective_approach = approach or "V2"
+            self._send_html(200, render_dashboard_html(country_filter=country, audience_filter=audience, approach_filter=effective_approach))
             return
         if parsed.path == "/api/pricing/state":
             st = self.store.get_pricing_state()
@@ -197,14 +217,73 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         if not text and html:
             text = re.sub(r"<[^>]+>", " ", html).strip()
 
-        lead_id = self.store.get_lead_id_by_email(from_email)
-        if not lead_id:
+        lead_ctx = self.store.get_lead_context_by_email(from_email)
+        if not lead_ctx:
             self.logger.write(
                 "reply_received_unmatched",
                 {"channel": "EMAIL", "from": from_email, "payload_keys": list(data.keys())},
             )
             self._send_json(202, {"ok": True, "matched": False, "queued": False})
             return
+        lead_id = int(lead_ctx["id"])
+
+        if lead_ctx.get("approach_version") == "v2_identity_probe" and lead_ctx.get("stage") == "VERIFY_WAITING":
+            decision, confidence = classify_identity_reply(text)
+            self.store.save_reply(lead_id, "EMAIL", text, f"identity_{decision}", confidence)
+            self.logger.write(
+                "identity_reply_received",
+                {
+                    "lead_id": lead_id,
+                    "channel": "EMAIL",
+                    "decision": decision,
+                    "confidence": confidence,
+                    "from": from_email,
+                },
+            )
+            if decision == "negative":
+                self.store.update_stage(lead_id, "IDENTITY_REJECTED")
+                self._send_json(202, {"ok": True, "matched": True, "queued": False, "lead_id": lead_id, "identity": "negative"})
+                return
+            if decision == "positive":
+                if not self.email_client:
+                    self._send_json(500, {"ok": False, "error": "email_client_not_configured"})
+                    return
+                locale = self._lead_locale(str(lead_ctx.get("phone") or ""), str(lead_ctx.get("address") or ""))
+                unsubscribe_base = os.getenv("UNSUBSCRIBE_BASE_URL", "https://api.renandias.site")
+                unsub = build_unsubscribe_url(unsubscribe_base, lead_id, "EMAIL")
+                subject, body_text, html_out = initial_consent_email(
+                    str(lead_ctx.get("business_name") or ""),
+                    unsub,
+                    variant=((lead_id % 3) + 1),
+                    city=str(lead_ctx.get("address") or ""),
+                    has_website=bool(str(lead_ctx.get("website") or "").strip()),
+                    locale=locale,
+                )
+                sent = self.email_client.send(from_email, subject, html_out)
+                self.store.save_touch(
+                    lead_id,
+                    "EMAIL",
+                    "CONSENT_REQUEST",
+                    "email_v2_handoff",
+                    sent.status,
+                    sent.message_id,
+                    body_text,
+                )
+                if sent.ok:
+                    self.store.update_stage(lead_id, "WAITING_REPLY")
+                    self.store.mark_contact_sent(from_email, "EMAIL", "CONSENT_REQUEST", lead_id)
+                    self.logger.write(
+                        "contact_delivered",
+                        {"lead_id": lead_id, "channel": "EMAIL", "intent": "CONSENT_REQUEST", "source": "identity_handoff"},
+                    )
+                    self._send_json(202, {"ok": True, "matched": True, "queued": False, "lead_id": lead_id, "identity": "positive", "handoff_sent": True})
+                    return
+                self.logger.write(
+                    "contact_failed",
+                    {"lead_id": lead_id, "channel": "EMAIL", "intent": "CONSENT_REQUEST", "detail": sent.detail, "source": "identity_handoff"},
+                )
+                self._send_json(502, {"ok": False, "error": "handoff_send_failed", "detail": sent.detail, "lead_id": lead_id})
+                return
 
         queue_id = self.store.enqueue_reply_review(lead_id=lead_id, channel="EMAIL", inbound_text=text)
         self.store.save_reply(lead_id, "EMAIL", text, "queued_for_codex", 0.0)
@@ -491,6 +570,18 @@ class LeadgenApiHandler(BaseHTTPRequestHandler):
         )
         self.logger.write("domain_job_created", {"run_id": run_id, "lead_id": lead_id, "status": "DOMAIN_SELECTED"})
         self._send_json(200, {"ok": True, "sale": sale})
+
+    @staticmethod
+    def _lead_locale(phone: str, address: str) -> str:
+        digits = re.sub(r"\D+", "", phone or "")
+        addr = (address or "").lower()
+        if digits.startswith("55"):
+            return "pt-BR"
+        if any(tok in addr for tok in ["brasil", "brazil", "sao paulo", "rio de janeiro", "belo horizonte", "fortaleza", "salvador", "recife"]):
+            return "pt-BR"
+        if re.search(r"\b(sp|rj|mg|ba|ce|pr|rs|sc|go|df)\b", addr):
+            return "pt-BR"
+        return "en"
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8787) -> None:

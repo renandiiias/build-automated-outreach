@@ -26,6 +26,7 @@ from .outreach import (
     classify_reply,
     get_resend_client_from_env,
     get_wpp_client_from_env,
+    identity_probe_email,
     initial_consent_email,
     initial_consent_whatsapp,
     is_opt_out_reply,
@@ -168,7 +169,13 @@ class LeadPipelineRunner:
             leads_before = self.store.count_leads()
             country_code = self._country_code_for_location(location)
             for row in rows_qualified:
-                lead_id = self.store.upsert_lead_from_row(run_id, row, audience=audience, country_code=country_code)
+                lead_id = self.store.upsert_lead_from_row(
+                    run_id,
+                    row,
+                    audience=audience,
+                    country_code=country_code,
+                    approach_version="v2_identity_probe",
+                )
                 self.store.update_stage(lead_id, "QUALIFIED")
                 self.logger.write(
                     "lead_qualified",
@@ -247,123 +254,64 @@ class LeadPipelineRunner:
             return 0
 
         scope = self._outreach_scope_from_run_id(run_id)
-        leads = self.store.list_leads_for_initial_contact(limit=250, run_id_prefix=scope)
+        leads = self.store.list_leads_for_identity_probe(limit=250, run_id_prefix=scope)
         count = 0
         day_index = self._campaign_day_index()
         email_limit = email_warmup_daily_limit(day_index)
         email_metrics = self.ops.get_channel_metrics("EMAIL")
-        wa_metrics = self.ops.get_channel_metrics("WHATSAPP")
 
         for lead in leads:
             if count >= 250:
                 break
-            if self.email_only and lead.channel_preferred == "WHATSAPP":
+            if self.ops.is_channel_paused("EMAIL"):
+                continue
+            if email_metrics.sent >= email_limit:
+                self.logger.write(
+                    "deliverability_alert",
+                    {
+                        "run_id": run_id,
+                        "channel": "EMAIL",
+                        "daily_sent": email_metrics.sent,
+                        "daily_limit": email_limit,
+                    },
+                )
+                break
+            if self.store.is_opted_out(lead.email, "EMAIL"):
+                continue
+            email_contact = (lead.email or "").strip().lower()
+            if self.store.has_contact_been_sent(email_contact, "EMAIL", "IDENTITY_CHECK"):
                 self.logger.write(
                     "lead_skipped",
-                    {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "email_only_mode"},
+                    {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "duplicate_contact_guard"},
                 )
                 continue
-            if lead.channel_preferred == "EMAIL" and lead.email:
-                if self.ops.is_channel_paused("EMAIL"):
-                    continue
-                if email_metrics.sent >= email_limit:
-                    self.logger.write(
-                        "deliverability_alert",
-                        {
-                            "run_id": run_id,
-                            "channel": "EMAIL",
-                            "daily_sent": email_metrics.sent,
-                            "daily_limit": email_limit,
-                        },
-                    )
-                    break
-
-                if self.store.is_opted_out(lead.email, "EMAIL"):
-                    continue
-                email_contact = (lead.email or "").strip().lower()
-                if self.store.has_contact_been_sent(email_contact, "EMAIL", "CONSENT_REQUEST"):
-                    self.logger.write(
-                        "lead_skipped",
-                        {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "duplicate_contact_guard"},
-                    )
-                    continue
-                if not self.email_client:
-                    self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "client_not_configured"})
-                    continue
-
-                variant = (lead.id % 3) + 1
-                unsub = build_unsubscribe_url(self.unsubscribe_base, lead.id, "EMAIL")
-                subject, body_text, html = initial_consent_email(
-                    lead.business_name,
-                    unsub,
-                    variant=variant,
-                    city=lead.address,
-                    has_website=bool((lead.website or "").strip()),
-                    locale=self._lead_locale(lead.phone, lead.address),
-                )
-                sent = self.email_client.send(lead.email, subject, html)
-                self.store.save_touch(lead.id, "EMAIL", "CONSENT_REQUEST", f"email_v{variant}", sent.status, sent.message_id, body_text)
-                self.ops.add_channel_metrics("EMAIL", sent=1, failed=0 if sent.ok else 1)
-                email_metrics = self.ops.get_channel_metrics("EMAIL")
-                count += 1
-                if sent.ok:
-                    self.store.update_stage(lead.id, "WAITING_REPLY")
-                    self.store.mark_contact_sent(email_contact, "EMAIL", "CONSENT_REQUEST", lead.id)
-                    self.logger.write("contact_delivered", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "daily_sent": email_metrics.sent})
-                else:
-                    self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "detail": sent.detail})
-
-                random_human_delay()
-                self._evaluate_email_health(run_id)
+            if not self.email_client:
+                self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "reason": "client_not_configured"})
                 continue
 
-            if lead.channel_preferred == "WHATSAPP" and lead.phone:
-                if self.ops.is_channel_paused("WHATSAPP"):
-                    continue
-                if wa_metrics.sent >= self.wa_daily_limit:
-                    self.logger.write(
-                        "deliverability_alert",
-                        {
-                            "run_id": run_id,
-                            "channel": "WHATSAPP",
-                            "daily_sent": wa_metrics.sent,
-                            "daily_limit": self.wa_daily_limit,
-                        },
-                    )
-                    break
-                if self.store.is_opted_out(lead.phone, "WHATSAPP"):
-                    continue
-                if not self.wa_client:
-                    self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "client_not_configured"})
-                    continue
-                normalized = normalize_phone_br(lead.phone)
-                if not normalized:
-                    self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "invalid_phone"})
-                    continue
-                if self.store.has_contact_been_sent(normalized, "WHATSAPP", "CONSENT_REQUEST"):
-                    self.logger.write(
-                        "lead_skipped",
-                        {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "reason": "duplicate_contact_guard"},
-                    )
-                    continue
-                msg = initial_consent_whatsapp(
-                    lead.business_name,
-                    has_website=bool((lead.website or "").strip()),
-                    locale=self._lead_locale(lead.phone, lead.address),
+            locale = self._lead_locale(lead.phone, lead.address)
+            subject, body_text, html = identity_probe_email(
+                lead.business_name,
+                city=lead.address,
+                locale=locale,
+            )
+            sent = self.email_client.send(lead.email, subject, html)
+            self.store.save_touch(lead.id, "EMAIL", "IDENTITY_CHECK", "email_identity_v1", sent.status, sent.message_id, body_text)
+            self.ops.add_channel_metrics("EMAIL", sent=1, failed=0 if sent.ok else 1)
+            email_metrics = self.ops.get_channel_metrics("EMAIL")
+            count += 1
+            if sent.ok:
+                self.store.update_stage(lead.id, "VERIFY_WAITING")
+                self.store.mark_contact_sent(email_contact, "EMAIL", "IDENTITY_CHECK", lead.id)
+                self.logger.write(
+                    "contact_delivered",
+                    {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "intent": "IDENTITY_CHECK", "daily_sent": email_metrics.sent},
                 )
-                sent = self.wa_client.send(normalized, msg)
-                self.store.save_touch(lead.id, "WHATSAPP", "CONSENT_REQUEST", "wa_v1", sent.status, sent.message_id, msg)
-                self.ops.add_channel_metrics("WHATSAPP", sent=1, failed=0 if sent.ok else 1)
-                wa_metrics = self.ops.get_channel_metrics("WHATSAPP")
-                count += 1
-                if sent.ok:
-                    self.store.update_stage(lead.id, "WAITING_REPLY")
-                    self.store.mark_contact_sent(normalized, "WHATSAPP", "CONSENT_REQUEST", lead.id)
-                    self.logger.write("contact_delivered", {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP"})
-                else:
-                    self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "WHATSAPP", "detail": sent.detail})
-                random_human_delay()
-                self._evaluate_whatsapp_health(run_id)
+            else:
+                self.logger.write("contact_failed", {"run_id": run_id, "lead_id": lead.id, "channel": "EMAIL", "detail": sent.detail, "intent": "IDENTITY_CHECK"})
+
+            random_human_delay()
+            self._evaluate_email_health(run_id)
 
         self._evaluate_global_safe_mode(run_id)
         return count

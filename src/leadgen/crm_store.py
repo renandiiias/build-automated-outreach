@@ -116,6 +116,7 @@ class CrmStore:
                     channel_preferred TEXT NOT NULL,
                     audience TEXT NOT NULL DEFAULT '',
                     country_code TEXT NOT NULL DEFAULT '',
+                    approach_version TEXT NOT NULL DEFAULT 'v1_legacy',
                     opt_out INTEGER NOT NULL DEFAULT 0,
                     consent_accepted INTEGER NOT NULL DEFAULT 0,
                     preview_url TEXT NOT NULL DEFAULT '',
@@ -281,6 +282,7 @@ class CrmStore:
             ("lost_at_utc", "ALTER TABLE leads ADD COLUMN lost_at_utc TEXT NOT NULL DEFAULT ''"),
             ("audience", "ALTER TABLE leads ADD COLUMN audience TEXT NOT NULL DEFAULT ''"),
             ("country_code", "ALTER TABLE leads ADD COLUMN country_code TEXT NOT NULL DEFAULT ''"),
+            ("approach_version", "ALTER TABLE leads ADD COLUMN approach_version TEXT NOT NULL DEFAULT 'v1_legacy'"),
         ]
         for col, sql in migrations:
             if col not in lead_cols:
@@ -294,8 +296,17 @@ class CrmStore:
                 guessed = _infer_country_code(str(row[1] or ""), str(row[2] or ""))
                 if guessed:
                     conn.execute("UPDATE leads SET country_code=? WHERE id=?", (guessed, int(row[0])))
+        if "approach_version" in {str(r[1]) for r in conn.execute("PRAGMA table_info(leads)").fetchall()}:
+            conn.execute("UPDATE leads SET approach_version='v1_legacy' WHERE trim(COALESCE(approach_version, '')) = ''")
 
-    def upsert_lead_from_row(self, run_id: str, row: dict[str, Any], audience: str = "", country_code: str = "") -> int:
+    def upsert_lead_from_row(
+        self,
+        run_id: str,
+        row: dict[str, Any],
+        audience: str = "",
+        country_code: str = "",
+        approach_version: str = "v2_identity_probe",
+    ) -> int:
         now = self._now().isoformat()
         name = str(row.get("name", "")).strip()
         phone = str(row.get("phone", "")).strip()
@@ -305,6 +316,7 @@ class CrmStore:
         address = str(row.get("address", "")).strip()
         normalized_audience = str(audience or "").strip()
         normalized_country = str(country_code or "").strip().upper() or _infer_country_code(phone, address)
+        normalized_approach = str(approach_version or "v2_identity_probe").strip() or "v2_identity_probe"
 
         preferred = "EMAIL" if email else ("WHATSAPP" if phone else "NONE")
         stage = "NEW"
@@ -314,8 +326,8 @@ class CrmStore:
                 """
                 INSERT INTO leads (
                     run_id, business_name, maps_url, phone, email, website, address,
-                    stage, channel_preferred, audience, country_code, created_at_utc, updated_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stage, channel_preferred, audience, country_code, approach_version, created_at_utc, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(maps_url) DO UPDATE SET
                     run_id=excluded.run_id,
                     business_name=excluded.business_name,
@@ -326,6 +338,10 @@ class CrmStore:
                     channel_preferred=excluded.channel_preferred,
                     audience=CASE WHEN excluded.audience != '' THEN excluded.audience ELSE leads.audience END,
                     country_code=CASE WHEN excluded.country_code != '' THEN excluded.country_code ELSE leads.country_code END,
+                    approach_version=CASE
+                        WHEN leads.stage IN ('NEW', 'QUALIFIED') THEN excluded.approach_version
+                        ELSE leads.approach_version
+                    END,
                     updated_at_utc=excluded.updated_at_utc
                 """,
                 (
@@ -340,6 +356,7 @@ class CrmStore:
                     preferred,
                     normalized_audience,
                     normalized_country,
+                    normalized_approach,
                     now,
                     now,
                 ),
@@ -380,6 +397,37 @@ class CrmStore:
                     """,
                     (limit,),
                 ).fetchall()
+        return [Lead(*self._normalize_lead_row(row)) for row in rows]
+
+    def list_leads_for_identity_probe(self, limit: int = 100, run_id_prefix: str = "") -> list[Lead]:
+        with self._connect() as conn:
+            params: list[Any] = []
+            if run_id_prefix.strip():
+                sql = """
+                    SELECT id, run_id, business_name, maps_url, phone, email, website, address, stage, channel_preferred, opt_out
+                    FROM leads
+                    WHERE stage IN ('NEW', 'QUALIFIED')
+                      AND opt_out = 0
+                      AND channel_preferred = 'EMAIL'
+                      AND trim(COALESCE(email, '')) != ''
+                      AND approach_version = 'v2_identity_probe'
+                      AND run_id LIKE ?
+                    ORDER BY id ASC LIMIT ?
+                """
+                params.extend([f"{run_id_prefix}%", limit])
+            else:
+                sql = """
+                    SELECT id, run_id, business_name, maps_url, phone, email, website, address, stage, channel_preferred, opt_out
+                    FROM leads
+                    WHERE stage IN ('NEW', 'QUALIFIED')
+                      AND opt_out = 0
+                      AND channel_preferred = 'EMAIL'
+                      AND trim(COALESCE(email, '')) != ''
+                      AND approach_version = 'v2_identity_probe'
+                    ORDER BY id ASC LIMIT ?
+                """
+                params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
         return [Lead(*self._normalize_lead_row(row)) for row in rows]
 
     def list_leads_for_offer(self, limit: int = 100) -> list[Lead]:
@@ -471,6 +519,32 @@ class CrmStore:
         if not row:
             return None
         return int(row[0])
+
+    def get_lead_context_by_email(self, email: str) -> dict[str, Any] | None:
+        if not email:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, business_name, phone, email, website, address, stage, approach_version
+                FROM leads
+                WHERE lower(email)=lower(?)
+                ORDER BY id DESC LIMIT 1
+                """,
+                (email.strip(),),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "business_name": str(row[1] or ""),
+            "phone": str(row[2] or ""),
+            "email": str(row[3] or ""),
+            "website": str(row[4] or ""),
+            "address": str(row[5] or ""),
+            "stage": str(row[6] or ""),
+            "approach_version": str(row[7] or "v1_legacy"),
+        }
 
     def get_preview_and_payment(self, lead_id: int) -> tuple[str, str]:
         with self._connect() as conn:

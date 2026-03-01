@@ -170,6 +170,30 @@ def initial_consent_email(
     return subject, body, html
 
 
+def identity_probe_email(
+    name: str,
+    service_hint: str = "",
+    city: str = "",
+    locale: str = "en",
+) -> tuple[str, str, str]:
+    service_text = (service_hint or "servicos como o de voces").strip()
+    city_text = (city or "essa regiao").strip()
+    if _is_pt_br(locale):
+        subject = f"por acaso esse e-mail e da equipe {name}?"
+        body = (
+            f"Oi, por acaso esse e-mail e da equipe {name}?\n\n"
+            f"Pesquisei no Google por {service_text} em {city_text} e encontrei esse contato aqui."
+        )
+    else:
+        service_text = (service_hint or "businesses like yours").strip()
+        subject = f"is this the right email for {name}?"
+        body = (
+            f"Hi, is this the right email for {name}?\n\n"
+            f"I was searching Google for {service_text} in {city_text} and found this contact."
+        )
+    return subject, body, body.replace("\n", "<br>")
+
+
 def initial_consent_whatsapp(name: str, has_website: bool = False, locale: str = "en") -> str:
     if _is_pt_br(locale):
         pitch = (
@@ -477,6 +501,45 @@ def classify_reply(text: str) -> tuple[str, float]:
     if "trust" in t or "guarantee" in t or "confi" in t or "garantia" in t:
         return "objection_trust", 0.75
     return "neutral", 0.5
+
+
+def classify_identity_reply(text: str) -> tuple[str, float]:
+    t = (text or "").strip().lower()
+    compact = re.sub(r"\s+", " ", t)
+    yes_tokens = [
+        "sim",
+        "yes",
+        "this is",
+        "speaking",
+        "sou eu",
+        "sou da equipe",
+        "pode falar",
+        "pode mandar",
+        "isso mesmo",
+        "correct",
+        "that is us",
+        "this is the right email",
+    ]
+    no_tokens = [
+        "nao",
+        "não",
+        "no",
+        "wrong email",
+        "wrong person",
+        "not me",
+        "not us",
+        "nao sou",
+        "não sou",
+        "email errado",
+        "contato errado",
+    ]
+    if any(token in compact for token in no_tokens):
+        return "negative", 0.92
+    if any(token in compact for token in yes_tokens):
+        return "positive", 0.9
+    if compact in {"ok", "okay", "certo", "quem fala?", "who is this?"}:
+        return "unclear", 0.45
+    return "unclear", 0.3
 
 
 def detect_plan_choice(text: str) -> str:
