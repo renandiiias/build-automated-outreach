@@ -157,6 +157,18 @@ def _identity_service_label(service_hint: str, locale: str) -> str:
         if _is_spanish(locale):
             return "espacios de coworking"
         return "coworking spaces"
+    if "electrician" in raw or "eletricista" in raw or "electricista" in raw:
+        if _is_pt_br(locale):
+            return "eletricistas"
+        if _is_spanish(locale):
+            return "electricistas"
+        return "electricians"
+    if "plumber" in raw or "encanador" in raw or "fontanero" in raw:
+        if _is_pt_br(locale):
+            return "encanadores"
+        if _is_spanish(locale):
+            return "fontaneros"
+        return "plumbers"
     if _is_pt_br(locale):
         return "negocios como o de voces"
     if _is_spanish(locale):
