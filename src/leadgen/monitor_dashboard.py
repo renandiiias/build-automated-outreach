@@ -640,6 +640,164 @@ def _template_performance_snapshot(
     return {"rows": out_rows, "ab_v2_handoff": ab_rows}
 
 
+def _reply_stage_snapshot(
+    db_path: Path,
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+    approach_filter: str = "ALL",
+) -> dict[str, Any]:
+    defaults = {
+        "stages": [
+            {"order": 1, "template_id": "email_identity_v1", "label": "1º email", "sent_count": 0, "replied_count": 0, "sample_message": "", "details": []},
+            {"order": 2, "template_id": "email_followup_1", "label": "2º email", "sent_count": 0, "replied_count": 0, "sample_message": "", "details": []},
+            {"order": 3, "template_id": "email_followup_2", "label": "3º email", "sent_count": 0, "replied_count": 0, "sample_message": "", "details": []},
+        ]
+    }
+    if not db_path.exists():
+        return defaults
+    templates = [("email_identity_v1", 1, "1º email"), ("email_followup_1", 2, "2º email"), ("email_followup_2", 3, "3º email")]
+    try:
+        with sqlite3.connect(db_path) as conn:
+            clauses, params = _lead_filter_clauses(country_filter, audience_filter, approach_filter, "l")
+            lead_where = f" AND {' AND '.join(clauses)}" if clauses else ""
+            placeholders = ",".join(["?"] * len(templates))
+            template_ids = [tpl for tpl, _, _ in templates]
+
+            sent_rows = conn.execute(
+                f"""
+                SELECT t.template_id, COUNT(*)
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                WHERE t.channel='EMAIL'
+                  AND t.template_id IN ({placeholders})
+                  {lead_where}
+                GROUP BY t.template_id
+                """,
+                [*template_ids, *params],
+            ).fetchall()
+            sent_map = {str(r[0]): int(r[1]) for r in sent_rows}
+
+            # Descobre qual foi a última touch antes da primeira reply do lead.
+            replied_rows = conn.execute(
+                f"""
+                WITH ranked_replies AS (
+                  SELECT r.lead_id, r.timestamp_utc, r.body,
+                         ROW_NUMBER() OVER (PARTITION BY r.lead_id ORDER BY r.timestamp_utc ASC, r.id ASC) AS rn
+                  FROM replies r
+                ),
+                first_reply AS (
+                  SELECT lead_id, timestamp_utc, body
+                  FROM ranked_replies
+                  WHERE rn = 1
+                ),
+                ranked_touches AS (
+                  SELECT t.lead_id, t.template_id, t.timestamp_utc,
+                         ROW_NUMBER() OVER (PARTITION BY t.lead_id ORDER BY t.timestamp_utc DESC, t.id DESC) AS rn
+                  FROM touches t
+                  JOIN first_reply fr ON fr.lead_id = t.lead_id AND t.timestamp_utc <= fr.timestamp_utc
+                  JOIN leads l ON l.id = t.lead_id
+                  WHERE t.channel='EMAIL'
+                    AND t.template_id IN ({placeholders})
+                    {lead_where}
+                )
+                SELECT rt.template_id, COUNT(*)
+                FROM ranked_touches rt
+                WHERE rt.rn = 1
+                GROUP BY rt.template_id
+                """,
+                [*template_ids, *params],
+            ).fetchall()
+            replied_map = {str(r[0]): int(r[1]) for r in replied_rows}
+
+            sample_rows = conn.execute(
+                f"""
+                SELECT t.template_id, t.body
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                WHERE t.channel='EMAIL'
+                  AND t.template_id IN ({placeholders})
+                  {lead_where}
+                  AND trim(COALESCE(t.body, '')) != ''
+                ORDER BY t.id DESC
+                LIMIT 300
+                """,
+                [*template_ids, *params],
+            ).fetchall()
+            sample_map: dict[str, str] = {}
+            for tpl, body in sample_rows:
+                key = str(tpl or "")
+                if key and key not in sample_map and str(body or "").strip():
+                    sample_map[key] = str(body or "").strip()
+
+            detail_rows = conn.execute(
+                f"""
+                WITH ranked_replies AS (
+                  SELECT r.lead_id, r.timestamp_utc, r.body,
+                         ROW_NUMBER() OVER (PARTITION BY r.lead_id ORDER BY r.timestamp_utc ASC, r.id ASC) AS rn
+                  FROM replies r
+                ),
+                first_reply AS (
+                  SELECT lead_id, timestamp_utc, body
+                  FROM ranked_replies
+                  WHERE rn = 1
+                ),
+                ranked_touches AS (
+                  SELECT t.lead_id, t.template_id, t.timestamp_utc,
+                         ROW_NUMBER() OVER (PARTITION BY t.lead_id ORDER BY t.timestamp_utc DESC, t.id DESC) AS rn
+                  FROM touches t
+                  JOIN first_reply fr ON fr.lead_id = t.lead_id AND t.timestamp_utc <= fr.timestamp_utc
+                  JOIN leads l ON l.id = t.lead_id
+                  WHERE t.channel='EMAIL'
+                    AND t.template_id IN ({placeholders})
+                    {lead_where}
+                )
+                SELECT rt.template_id, l.id, l.business_name, l.email, fr.timestamp_utc, fr.body
+                FROM ranked_touches rt
+                JOIN first_reply fr ON fr.lead_id = rt.lead_id
+                JOIN leads l ON l.id = rt.lead_id
+                WHERE rt.rn = 1
+                ORDER BY fr.timestamp_utc DESC
+                LIMIT 120
+                """,
+                [*template_ids, *params],
+            ).fetchall()
+
+    except sqlite3.Error:
+        return defaults
+
+    details_map: dict[str, list[dict[str, Any]]] = {tpl: [] for tpl, _, _ in templates}
+    for tpl, lead_id, business_name, email, ts, body in detail_rows:
+        key = str(tpl or "")
+        if key not in details_map:
+            continue
+        if len(details_map[key]) >= 30:
+            continue
+        details_map[key].append(
+            {
+                "lead_id": int(lead_id),
+                "business_name": str(business_name or ""),
+                "email": str(email or ""),
+                "timestamp_utc": str(ts or ""),
+                "reply_body": str(body or ""),
+            }
+        )
+
+    stages: list[dict[str, Any]] = []
+    for tpl, order, label in templates:
+        stages.append(
+            {
+                "order": order,
+                "template_id": tpl,
+                "label": label,
+                "sent_count": int(sent_map.get(tpl, 0)),
+                "replied_count": int(replied_map.get(tpl, 0)),
+                "sample_message": sample_map.get(tpl, ""),
+                "details": details_map.get(tpl, []),
+            }
+        )
+    return {"stages": stages}
+
+
 def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     counter = Counter()
     for e in events:
@@ -683,6 +841,7 @@ def build_snapshot(country_filter: str = "ALL", audience_filter: str = "ALL", ap
         "domain_ops": _domain_ops_snapshot(cfg.state_db),
         "reply_queue": _reply_queue_snapshot(cfg.state_db),
         "template_performance": _template_performance_snapshot(cfg.state_db, country, audience, approach),
+        "reply_stage": _reply_stage_snapshot(cfg.state_db, country, audience, approach),
         "events_summary": _compute_event_summary(events),
         "events": events[-50:],
     }
@@ -753,6 +912,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     filters = snap["filters"]
     es = snap["events_summary"]
     template_perf = snap["template_performance"]
+    reply_stage = snap["reply_stage"]
     progress_pct = min(100, int((pricing["offers_in_window"] / 10) * 100))
     safe_mode = "ATIVO" if ops["global_safe_mode"] else "NORMAL"
     safe_class = "is-bad" if ops["global_safe_mode"] else "is-ok"
@@ -959,6 +1119,45 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         )
         for it in template_perf["ab_v2_handoff"]
     ) or "<tr><td colspan='4'>Sem dados A/B ainda.</td></tr>"
+
+    stage_blocks = ""
+    for stage in reply_stage["stages"]:
+        sample = str(stage.get("sample_message") or "").strip()
+        sample_short = (sample[:220] + "...") if len(sample) > 220 else sample
+        sent_count = int(stage.get("sent_count", 0))
+        replied_count = int(stage.get("replied_count", 0))
+        rate = (replied_count / sent_count * 100.0) if sent_count else 0.0
+        tooltip_text = _safe(sample_short or "Sem amostra da mensagem dessa etapa ainda.")
+        details_rows = "".join(
+            (
+                f"<tr>"
+                f"<td>#{d['lead_id']}</td>"
+                f"<td>{_safe(d['business_name'])}</td>"
+                f"<td>{_safe(d['email'])}</td>"
+                f"<td>{_safe(d['timestamp_utc'])}</td>"
+                f"<td><code>{_safe((d['reply_body'] or '')[:280])}</code></td>"
+                f"</tr>"
+            )
+            for d in stage.get("details", [])
+        ) or "<tr><td colspan='5'>Sem respostas registradas para esta etapa.</td></tr>"
+        stage_blocks += (
+            f"<article class='stage-card'>"
+            f"<div class='stage-head'>"
+            f"<div class='stage-title' title='{tooltip_text}'>{_safe(stage['label'])} <span class='muted'>({ _safe(stage['template_id']) })</span></div>"
+            f"<div class='stage-metrics'><b>{replied_count}</b>/<span>{sent_count}</span> <small>{rate:.1f}%</small></div>"
+            f"</div>"
+            f"<div class='muted stage-tooltip'>Passe o mouse no título para ver a mensagem enviada nesta etapa.</div>"
+            f"<details class='stage-details'>"
+            f"<summary>Ver quem respondeu e o que respondeu</summary>"
+            f"<div class='scroll-table' style='margin-top:8px; max-height:220px;'>"
+            f"<table>"
+            f"<thead><tr><th>Lead</th><th>Empresa</th><th>Email</th><th>Quando</th><th>Resposta</th></tr></thead>"
+            f"<tbody>{details_rows}</tbody>"
+            f"</table>"
+            f"</div>"
+            f"</details>"
+            f"</article>"
+        )
 
     country_choices = [
         ("ALL", "Geral"),
@@ -1392,6 +1591,57 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
       overflow: auto;
       padding-right: 2px;
     }}
+    .stage-grid {{
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap:10px;
+    }}
+    .stage-card {{
+      border:1px solid var(--line);
+      background: var(--card-soft);
+      border-radius: 10px;
+      padding: 10px;
+    }}
+    .stage-head {{
+      display:flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }}
+    .stage-title {{
+      font-size: 14px;
+      font-weight: 800;
+      cursor: help;
+    }}
+    .stage-metrics b {{
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--text);
+    }}
+    .stage-metrics span {{
+      font-size: 16px;
+      color: var(--muted);
+    }}
+    .stage-metrics small {{
+      margin-left:6px;
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 700;
+    }}
+    .stage-tooltip {{
+      margin-top: 4px;
+      margin-bottom: 6px;
+    }}
+    .stage-details summary {{
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      list-style: none;
+    }}
+    .stage-details summary::-webkit-details-marker {{
+      display:none;
+    }}
     .event-card {{
       border: 1px solid var(--line);
       border-radius: 10px;
@@ -1548,6 +1798,11 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
             </table>
           </div>
         </article>
+        <article class='card' style='margin-top:10px;'>
+          <h2 class='card-title'>Respostas por etapa de e-mail</h2>
+          <div class='muted' style='margin-bottom:8px;'>Aqui você vê quantos responderam no 1º, 2º e 3º e-mail.</div>
+          <div class='stage-grid'>{stage_blocks}</div>
+        </article>
       </div>
 
       <aside class='aside-stack'>
@@ -1587,7 +1842,10 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
 
         <article class='card'>
           <h2 class='card-title'>Timeline recente</h2>
-          <div class='event-feed'>{event_feed}</div>
+          <details>
+            <summary style='cursor:pointer; font-weight:700; color:var(--accent);'>Abrir timeline detalhada</summary>
+            <div class='event-feed' style='margin-top:8px;'>{event_feed}</div>
+          </details>
         </article>
       </aside>
     </section>
