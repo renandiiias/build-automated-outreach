@@ -478,7 +478,18 @@ def main() -> int:
                     "timeout_seconds": args.ingest_timeout_seconds,
                 },
             )
-            raise SystemExit(75)
+            # Nao derruba o processo inteiro por timeout de uma etapa.
+            # Mantem o runner vivo para evitar loop de restart do systemd.
+            runner.logger.write(
+                "campaign_cycle_degraded",
+                {
+                    "run_id": run_id,
+                    "cycle_id": cycle_id,
+                    "reason": "ingest_timeout",
+                    "action": "continue_next_cycle",
+                },
+            )
+            ingested = 0
         runner.logger.write("campaign_step_finished", {"run_id": run_id, "cycle_id": cycle_id, "step": "ingest", "ingested": ingested})
 
         runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_initial_outreach"})
@@ -494,7 +505,16 @@ def main() -> int:
                     "timeout_seconds": args.outreach_timeout_seconds,
                 },
             )
-            raise SystemExit(75)
+            runner.logger.write(
+                "campaign_cycle_degraded",
+                {
+                    "run_id": run_id,
+                    "cycle_id": cycle_id,
+                    "reason": "send_initial_outreach_timeout",
+                    "action": "skip_step",
+                },
+            )
+            consent = 0
         runner.logger.write("campaign_step_finished", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_initial_outreach", "sent": consent})
 
         runner.logger.write("campaign_step_started", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_followups"})
@@ -510,7 +530,16 @@ def main() -> int:
                     "timeout_seconds": args.outreach_timeout_seconds,
                 },
             )
-            raise SystemExit(75)
+            runner.logger.write(
+                "campaign_cycle_degraded",
+                {
+                    "run_id": run_id,
+                    "cycle_id": cycle_id,
+                    "reason": "send_followups_timeout",
+                    "action": "skip_step",
+                },
+            )
+            followups = 0
         runner.logger.write("campaign_step_finished", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_followups", "sent": followups})
         offers = 0
         if args.payment_url:
@@ -532,7 +561,16 @@ def main() -> int:
                         "timeout_seconds": args.outreach_timeout_seconds,
                     },
                 )
-                raise SystemExit(75)
+                runner.logger.write(
+                    "campaign_cycle_degraded",
+                    {
+                        "run_id": run_id,
+                        "cycle_id": cycle_id,
+                        "reason": "send_offers_for_consented_timeout",
+                        "action": "skip_step",
+                    },
+                )
+                offers = 0
             runner.logger.write("campaign_step_finished", {"run_id": run_id, "cycle_id": cycle_id, "step": "send_offers_for_consented", "sent": offers})
 
         totals["ingested"] += ingested
