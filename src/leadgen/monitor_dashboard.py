@@ -91,6 +91,19 @@ def _read_last_events(path: Path, max_lines: int = 200) -> list[dict[str, Any]]:
     return out
 
 
+def _events_in_window(events: list[dict[str, Any]], *, hours: int | None = None, days: int | None = None) -> list[dict[str, Any]]:
+    if hours is None and days is None:
+        return events
+    delta = timedelta(hours=hours or 0, days=days or 0)
+    since = datetime.now(timezone.utc) - delta
+    out: list[dict[str, Any]] = []
+    for event in events:
+        ts = _parse_utc(str(event.get("timestamp_utc", "")))
+        if ts and ts >= since:
+            out.append(event)
+    return out
+
+
 def _db_counts(db_path: Path, country_filter: str = "ALL", audience_filter: str = "ALL", approach_filter: str = "ALL") -> dict[str, Any]:
     if not db_path.exists():
         return {"leads_total": 0, "stage_counts": {}, "touches_total": 0, "replies_total": 0}
@@ -648,9 +661,9 @@ def _reply_stage_snapshot(
 ) -> dict[str, Any]:
     defaults = {
         "stages": [
-            {"order": 1, "template_id": "email_identity_v1", "label": "1º email", "sent_count": 0, "replied_count": 0, "sample_message": "", "details": []},
-            {"order": 2, "template_id": "email_followup_1", "label": "2º email", "sent_count": 0, "replied_count": 0, "sample_message": "", "details": []},
-            {"order": 3, "template_id": "email_followup_2", "label": "3º email", "sent_count": 0, "replied_count": 0, "sample_message": "", "details": []},
+            {"order": 1, "template_id": "email_identity_v1", "label": "1º email", "sent_count": 0, "replied_count": 0, "eligible_count": 0, "skipped_count": 0, "skip_reasons_top": [], "sample_message": "", "details": [], "reply_examples": []},
+            {"order": 2, "template_id": "email_followup_1", "label": "2º email", "sent_count": 0, "replied_count": 0, "eligible_count": 0, "skipped_count": 0, "skip_reasons_top": [], "sample_message": "", "details": [], "reply_examples": []},
+            {"order": 3, "template_id": "email_followup_2", "label": "3º email", "sent_count": 0, "replied_count": 0, "eligible_count": 0, "skipped_count": 0, "skip_reasons_top": [], "sample_message": "", "details": [], "reply_examples": []},
         ]
     }
     if not db_path.exists():
@@ -784,6 +797,7 @@ def _reply_stage_snapshot(
 
     stages: list[dict[str, Any]] = []
     for tpl, order, label in templates:
+        reply_examples = details_map.get(tpl, [])[:5]
         stages.append(
             {
                 "order": order,
@@ -791,11 +805,420 @@ def _reply_stage_snapshot(
                 "label": label,
                 "sent_count": int(sent_map.get(tpl, 0)),
                 "replied_count": int(replied_map.get(tpl, 0)),
+                "eligible_count": int(sent_map.get(tpl, 0)),
+                "skipped_count": 0,
+                "skip_reasons_top": [],
                 "sample_message": sample_map.get(tpl, ""),
                 "details": details_map.get(tpl, []),
+                "reply_examples": reply_examples,
             }
         )
     return {"stages": stages}
+
+
+def _reply_attribution_snapshot(
+    db_path: Path,
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+    approach_filter: str = "ALL",
+) -> dict[str, Any]:
+    defaults = {
+        "human_replies_count": 0,
+        "auto_replies_count": 0,
+        "unknown_replies_count": 0,
+        "rows": [],
+    }
+    if not db_path.exists():
+        return defaults
+    human_classes = {"positive", "negative", "not_now", "objection_price", "objection_trust", "neutral", "opt_out"}
+    auto_classes = {"auto_reply", "shared_inbox"}
+    try:
+        with sqlite3.connect(db_path) as conn:
+            clauses, params = _lead_filter_clauses(country_filter, audience_filter, approach_filter, "l")
+            where_clause = " AND ".join([*clauses, "r.channel='EMAIL'"]) if clauses else "r.channel='EMAIL'"
+            rows = conn.execute(
+                f"""
+                SELECT r.classification, COUNT(*)
+                FROM replies r
+                JOIN leads l ON l.id = r.lead_id
+                WHERE {where_clause}
+                GROUP BY r.classification
+                ORDER BY COUNT(*) DESC
+                """,
+                params,
+            ).fetchall()
+    except sqlite3.Error:
+        return defaults
+    out_rows = [{"classification": str(r[0] or ""), "count": int(r[1] or 0)} for r in rows]
+    human = sum(r["count"] for r in out_rows if r["classification"] in human_classes)
+    auto = sum(r["count"] for r in out_rows if r["classification"] in auto_classes)
+    unknown = sum(r["count"] for r in out_rows if r["classification"] not in human_classes and r["classification"] not in auto_classes)
+    return {
+        "human_replies_count": human,
+        "auto_replies_count": auto,
+        "unknown_replies_count": unknown,
+        "rows": out_rows,
+    }
+
+
+def _email_coverage_snapshot(
+    db_path: Path,
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+    approach_filter: str = "ALL",
+) -> dict[str, Any]:
+    defaults = {"rows": [], "contactable_7d": 0, "leads_7d": 0, "coverage_rate_7d": 0.0}
+    if not db_path.exists():
+        return defaults
+    since_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            clauses, params = _lead_filter_clauses(country_filter, audience_filter, approach_filter)
+            where_all = " AND ".join([*clauses, "created_at_utc >= ?"]) if clauses else "created_at_utc >= ?"
+            where_contactable = (
+                " AND ".join([*clauses, "created_at_utc >= ?", "trim(COALESCE(email, '')) != ''"])
+                if clauses
+                else "created_at_utc >= ? AND trim(COALESCE(email, '')) != ''"
+            )
+            leads_7d = int(conn.execute(f"SELECT COUNT(*) FROM leads WHERE {where_all}", [*params, since_7d]).fetchone()[0])
+            contactable_7d = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM leads WHERE {where_contactable}",
+                    [*params, since_7d],
+                ).fetchone()[0]
+            )
+            lead_clauses, lead_params = _lead_filter_clauses(country_filter, audience_filter, approach_filter)
+            where_sql = f"WHERE {' AND '.join(lead_clauses)}" if lead_clauses else ""
+            rows = conn.execute(
+                f"""
+                SELECT COALESCE(country_code, ''), COUNT(*),
+                       SUM(CASE WHEN trim(COALESCE(email, '')) != '' THEN 1 ELSE 0 END)
+                FROM leads
+                {where_sql}
+                GROUP BY COALESCE(country_code, '')
+                ORDER BY COUNT(*) DESC
+                """,
+                lead_params,
+            ).fetchall()
+    except sqlite3.Error:
+        return defaults
+    out_rows: list[dict[str, Any]] = []
+    for country_code, total, contactable in rows:
+        total_i = int(total or 0)
+        contact_i = int(contactable or 0)
+        out_rows.append(
+            {
+                "country": _derive_country("", "", str(country_code or "")),
+                "leads": total_i,
+                "contactable": contact_i,
+                "coverage_rate": (contact_i / total_i) if total_i else 0.0,
+            }
+        )
+    return {
+        "rows": out_rows,
+        "contactable_7d": contactable_7d,
+        "leads_7d": leads_7d,
+        "coverage_rate_7d": (contactable_7d / leads_7d) if leads_7d else 0.0,
+    }
+
+
+def _top_audience_snapshot(
+    db_path: Path,
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+    approach_filter: str = "ALL",
+) -> dict[str, Any]:
+    defaults = {"rows": []}
+    if not db_path.exists():
+        return defaults
+    try:
+        with sqlite3.connect(db_path) as conn:
+            clauses, params = _lead_filter_clauses(country_filter, audience_filter, approach_filter, "l")
+            where_sent = " AND ".join([*clauses, "t.channel='EMAIL'"]) if clauses else "t.channel='EMAIL'"
+            rows = conn.execute(
+                f"""
+                SELECT trim(COALESCE(l.audience, 'sem nicho')) AS audience_value,
+                       COUNT(*) AS sent_count,
+                       COUNT(DISTINCT CASE
+                         WHEN EXISTS (
+                           SELECT 1 FROM replies r
+                           WHERE r.lead_id = t.lead_id
+                             AND r.channel='EMAIL'
+                             AND r.timestamp_utc >= t.timestamp_utc
+                         ) THEN t.lead_id
+                         ELSE NULL
+                       END) AS replied_count
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                WHERE {where_sent}
+                GROUP BY lower(trim(COALESCE(l.audience, 'sem nicho')))
+                ORDER BY replied_count DESC, sent_count DESC, audience_value ASC
+                LIMIT 5
+                """,
+                params,
+            ).fetchall()
+    except sqlite3.Error:
+        return defaults
+    out = []
+    for audience_value, sent_count, replied_count in rows:
+        sent_i = int(sent_count or 0)
+        replied_i = int(replied_count or 0)
+        out.append(
+            {
+                "audience": str(audience_value or "sem nicho"),
+                "sent_count": sent_i,
+                "replied_count": replied_i,
+                "reply_rate": (replied_i / sent_i) if sent_i else 0.0,
+            }
+        )
+    return {"rows": out}
+
+
+def _top_country_snapshot(
+    db_path: Path,
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+    approach_filter: str = "ALL",
+) -> dict[str, Any]:
+    defaults = {"rows": []}
+    if not db_path.exists():
+        return defaults
+    try:
+        with sqlite3.connect(db_path) as conn:
+            clauses, params = _lead_filter_clauses(country_filter, audience_filter, approach_filter, "l")
+            where_sent = " AND ".join([*clauses, "t.channel='EMAIL'"]) if clauses else "t.channel='EMAIL'"
+            rows = conn.execute(
+                f"""
+                SELECT COALESCE(l.country_code, '') AS country_code,
+                       COUNT(*) AS sent_count,
+                       COUNT(DISTINCT CASE
+                         WHEN EXISTS (
+                           SELECT 1 FROM replies r
+                           WHERE r.lead_id = t.lead_id
+                             AND r.channel='EMAIL'
+                             AND r.timestamp_utc >= t.timestamp_utc
+                         ) THEN t.lead_id
+                         ELSE NULL
+                       END) AS replied_count
+                FROM touches t
+                JOIN leads l ON l.id = t.lead_id
+                WHERE {where_sent}
+                GROUP BY COALESCE(l.country_code, '')
+                ORDER BY replied_count DESC, sent_count DESC, country_code ASC
+                LIMIT 5
+                """,
+                params,
+            ).fetchall()
+    except sqlite3.Error:
+        return defaults
+    out = []
+    for country_code, sent_count, replied_count in rows:
+        sent_i = int(sent_count or 0)
+        replied_i = int(replied_count or 0)
+        out.append(
+            {
+                "country": _derive_country("", "", str(country_code or "")),
+                "sent_count": sent_i,
+                "replied_count": replied_i,
+                "reply_rate": (replied_i / sent_i) if sent_i else 0.0,
+            }
+        )
+    return {"rows": out}
+
+
+def _recent_blockers_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
+    recent_24h = _events_in_window(events, hours=24)
+    lead_skipped = Counter()
+    followup_skipped = Counter()
+    timeout_counter = Counter()
+    for event in recent_24h:
+        payload = event.get("payload") or {}
+        reason = str(payload.get("reason") or payload.get("detail") or payload.get("step") or "unknown")
+        event_type = str(event.get("event_type") or "")
+        if event_type == "lead_skipped":
+            lead_skipped[reason] += 1
+        elif event_type == "followup_skipped":
+            followup_skipped[reason] += 1
+        elif event_type == "campaign_step_timeout":
+            timeout_counter[reason] += 1
+    return {
+        "lead_skipped_top": [{"reason": k, "count": v} for k, v in lead_skipped.most_common(6)],
+        "followup_skipped_top": [{"reason": k, "count": v} for k, v in followup_skipped.most_common(6)],
+        "timeouts_top": [{"reason": k, "count": v} for k, v in timeout_counter.most_common(6)],
+        "lead_skipped_total": sum(lead_skipped.values()),
+        "followup_skipped_total": sum(followup_skipped.values()),
+        "timeouts_total": sum(timeout_counter.values()),
+    }
+
+
+def _owner_summary_snapshot(
+    db_path: Path,
+    events: list[dict[str, Any]],
+    reply_stage: dict[str, Any],
+    throughput: dict[str, Any],
+    funnel: dict[str, Any],
+    reply_attr: dict[str, Any],
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+    approach_filter: str = "ALL",
+) -> dict[str, Any]:
+    since_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    since_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    leads_24h = 0
+    waiting_confirmation = 0
+    ready_to_approach = 0
+    if db_path.exists():
+        try:
+            with sqlite3.connect(db_path) as conn:
+                clauses, params = _lead_filter_clauses(country_filter, audience_filter, approach_filter)
+                where_24h = " AND ".join([*clauses, "created_at_utc >= ?"]) if clauses else "created_at_utc >= ?"
+                where_ready = " AND ".join([*clauses, "stage='QUALIFIED'"]) if clauses else "stage='QUALIFIED'"
+                where_waiting = " AND ".join([*clauses, "stage='VERIFY_WAITING'"]) if clauses else "stage='VERIFY_WAITING'"
+                leads_24h = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM leads WHERE {where_24h}",
+                        [*params, since_24h],
+                    ).fetchone()[0]
+                )
+                ready_to_approach = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM leads WHERE {where_ready}",
+                        params,
+                    ).fetchone()[0]
+                )
+                waiting_confirmation = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM leads WHERE {where_waiting}",
+                        params,
+                    ).fetchone()[0]
+                )
+        except sqlite3.Error:
+            pass
+    blockers = _recent_blockers_snapshot(events)
+    sent_1 = int(reply_stage["stages"][0]["sent_count"]) if reply_stage["stages"] else 0
+    sent_2 = int(reply_stage["stages"][1]["sent_count"]) if len(reply_stage["stages"]) > 1 else 0
+    sent_3 = int(reply_stage["stages"][2]["sent_count"]) if len(reply_stage["stages"]) > 2 else 0
+    replied_1 = int(reply_stage["stages"][0]["replied_count"]) if reply_stage["stages"] else 0
+    replied_2 = int(reply_stage["stages"][1]["replied_count"]) if len(reply_stage["stages"]) > 1 else 0
+    replied_3 = int(reply_stage["stages"][2]["replied_count"]) if len(reply_stage["stages"]) > 2 else 0
+    return {
+        "entered": {"last_24h": leads_24h, "last_7d": funnel["leads_7d"]},
+        "approached": {"email_1": sent_1, "email_2": sent_2, "email_3": sent_3},
+        "responded": {
+            "email_1": replied_1,
+            "email_2": replied_2,
+            "email_3": replied_3,
+            "human_total": reply_attr["human_replies_count"],
+            "auto_total": reply_attr["auto_replies_count"],
+            "unknown_total": reply_attr["unknown_replies_count"],
+        },
+        "advanced": {
+            "consented_7d": funnel["consented_7d"],
+            "offers_7d": funnel["offers_7d"],
+            "won_7d": funnel["won_7d"],
+            "waiting_confirmation": waiting_confirmation,
+            "ready_to_approach": ready_to_approach,
+        },
+        "stuck": {
+            "lead_skipped_24h": blockers["lead_skipped_total"],
+            "followup_skipped_24h": blockers["followup_skipped_total"],
+            "timeouts_24h": blockers["timeouts_total"],
+            "no_response_total": max(0, sent_1 - replied_1),
+        },
+        "throughput": {
+            "touches_24h": throughput["touches_24h_total"],
+            "offers_24h": throughput["offers_24h"],
+            "replies_24h": throughput["replies_24h"],
+        },
+    }
+
+
+def _stage_loss_summary_snapshot(
+    db_path: Path,
+    events: list[dict[str, Any]],
+    funnel: dict[str, Any],
+    reply_stage: dict[str, Any],
+    email_coverage: dict[str, Any],
+    reply_attr: dict[str, Any],
+) -> dict[str, Any]:
+    blockers = _recent_blockers_snapshot(events)
+    sent_1 = int(reply_stage["stages"][0]["sent_count"]) if reply_stage["stages"] else 0
+    human_replies = int(reply_attr["human_replies_count"])
+    stage_rows = [
+        {
+            "label": "Leads encontrados",
+            "count": int(funnel["leads_7d"]),
+            "next_rate": (email_coverage["contactable_7d"] / funnel["leads_7d"]) if funnel["leads_7d"] else 0.0,
+            "loss_reason": "sem email valido" if email_coverage["contactable_7d"] < funnel["leads_7d"] else "sem perda relevante",
+        },
+        {
+            "label": "Leads com contato valido",
+            "count": int(email_coverage["contactable_7d"]),
+            "next_rate": (sent_1 / email_coverage["contactable_7d"]) if email_coverage["contactable_7d"] else 0.0,
+            "loss_reason": (blockers["lead_skipped_top"][0]["reason"] if blockers["lead_skipped_top"] else "sem bloqueios recentes"),
+        },
+        {
+            "label": "1º email enviado",
+            "count": sent_1,
+            "next_rate": (human_replies / sent_1) if sent_1 else 0.0,
+            "loss_reason": "sem resposta ao 1º email" if sent_1 > human_replies else "sem perda relevante",
+        },
+        {
+            "label": "Responderam confirmacao",
+            "count": human_replies,
+            "next_rate": (funnel["offers_7d"] / human_replies) if human_replies else 0.0,
+            "loss_reason": (blockers["followup_skipped_top"][0]["reason"] if blockers["followup_skipped_top"] else "sem oferta enviada"),
+        },
+        {
+            "label": "Oferta enviada",
+            "count": int(funnel["offers_7d"]),
+            "next_rate": (funnel["won_7d"] / funnel["offers_7d"]) if funnel["offers_7d"] else 0.0,
+            "loss_reason": "sem fechamento" if funnel["offers_7d"] > funnel["won_7d"] else "sem perda relevante",
+        },
+        {
+            "label": "Venda",
+            "count": int(funnel["won_7d"]),
+            "next_rate": 1.0 if funnel["won_7d"] else 0.0,
+            "loss_reason": "objetivo final",
+        },
+    ]
+    return {"rows": stage_rows}
+
+
+def _timeouts_summary_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
+    recent_24h = _events_in_window(events, hours=24)
+    recent_7d = _events_in_window(events, days=7)
+    timeouts_24h = [e for e in recent_24h if str(e.get("event_type") or "") == "campaign_step_timeout"]
+    timeouts_7d = [e for e in recent_7d if str(e.get("event_type") or "") == "campaign_step_timeout"]
+    by_step = Counter(str((e.get("payload") or {}).get("step") or "unknown") for e in timeouts_24h)
+    return {
+        "count_24h": len(timeouts_24h),
+        "count_7d": len(timeouts_7d),
+        "rows_24h": [{"step": k, "count": v} for k, v in by_step.most_common(5)],
+    }
+
+
+def _current_machine_status_snapshot(events: list[dict[str, Any]], throughput: dict[str, Any]) -> dict[str, Any]:
+    recent_30m = _events_in_window(events, hours=1)
+    recent_types = [str(e.get("event_type") or "") for e in recent_30m]
+    has_ingest = "campaign_step_started" in recent_types
+    has_timeout = "campaign_step_timeout" in recent_types
+    has_email_activity = throughput["touches_24h_total"] > 0
+    lines = [
+        {
+            "label": "A maquina esta buscando leads",
+            "status": "OK" if has_ingest and not has_timeout else ("Atencao" if has_ingest else "Acao necessaria"),
+        },
+        {
+            "label": "A maquina esta enviando emails",
+            "status": "OK" if has_email_activity else "Atencao",
+        },
+        {
+            "label": "A maquina esta travada por timeout",
+            "status": "Acao necessaria" if has_timeout else "OK",
+        },
+    ]
+    return {"lines": lines}
 
 
 def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -820,18 +1243,23 @@ def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
 def build_snapshot(country_filter: str = "ALL", audience_filter: str = "ALL", approach_filter: str = "ALL") -> dict[str, Any]:
     cfg = get_config()
     CrmStore(cfg.state_db)
-    events = _read_last_events(cfg.log_dir / "events.jsonl")
+    events = _read_last_events(cfg.log_dir / "events.jsonl", max_lines=600)
     country = _normalize_country_filter(country_filter)
     audience = _normalize_audience_filter(audience_filter)
     approach = _normalize_approach_filter(approach_filter)
+    throughput = _throughput_snapshot(cfg.state_db, events, country, audience, approach)
+    funnel = _funnel_7d(cfg.state_db, country, audience, approach)
+    reply_stage = _reply_stage_snapshot(cfg.state_db, country, audience, approach)
+    reply_attr = _reply_attribution_snapshot(cfg.state_db, country, audience, approach)
+    email_coverage = _email_coverage_snapshot(cfg.state_db, country, audience, approach)
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "db": _db_counts(cfg.state_db, country, audience, approach),
         "ops": _ops_snapshot(cfg.ops_state_db),
         "pricing": _pricing_snapshot(cfg.state_db),
-        "funnel_7d": _funnel_7d(cfg.state_db, country, audience, approach),
+        "funnel_7d": funnel,
         "geo_channels": _country_channel_snapshot(cfg.state_db, country, audience, approach),
-        "throughput": _throughput_snapshot(cfg.state_db, events, country, audience, approach),
+        "throughput": throughput,
         "filters": {
             "country": country,
             "audience": audience,
@@ -841,7 +1269,16 @@ def build_snapshot(country_filter: str = "ALL", audience_filter: str = "ALL", ap
         "domain_ops": _domain_ops_snapshot(cfg.state_db),
         "reply_queue": _reply_queue_snapshot(cfg.state_db),
         "template_performance": _template_performance_snapshot(cfg.state_db, country, audience, approach),
-        "reply_stage": _reply_stage_snapshot(cfg.state_db, country, audience, approach),
+        "reply_stage": reply_stage,
+        "reply_attribution": reply_attr,
+        "email_coverage": email_coverage,
+        "top_niches": _top_audience_snapshot(cfg.state_db, country, audience, approach),
+        "top_countries": _top_country_snapshot(cfg.state_db, country, audience, approach),
+        "followup_blockers": _recent_blockers_snapshot(events),
+        "timeouts_summary": _timeouts_summary_snapshot(events),
+        "owner_summary": _owner_summary_snapshot(cfg.state_db, events, reply_stage, throughput, funnel, reply_attr, country, audience, approach),
+        "stage_loss_summary": _stage_loss_summary_snapshot(cfg.state_db, events, funnel, reply_stage, email_coverage, reply_attr),
+        "current_machine": _current_machine_status_snapshot(events, throughput),
         "events_summary": _compute_event_summary(events),
         "events": events[-50:],
     }
@@ -900,8 +1337,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return render_dashboard_html(country_filter=country_filter, audience_filter=audience_filter, approach_filter=approach_filter)
 
 
-def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "ALL", approach_filter: str = "ALL") -> str:
-    snap = build_snapshot(country_filter=country_filter, audience_filter=audience_filter, approach_filter=approach_filter)
+def render_dashboard_html(
+    snapshot: dict[str, Any] | None = None,
+    country_filter: str = "ALL",
+    audience_filter: str = "ALL",
+    approach_filter: str = "ALL",
+) -> str:
+    snap = snapshot or build_snapshot(
+        country_filter=country_filter,
+        audience_filter=audience_filter,
+        approach_filter=approach_filter,
+    )
     pricing = snap["pricing"]
     funnel = snap["funnel_7d"]
     queue = snap["reply_queue"]
@@ -913,6 +1359,15 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     es = snap["events_summary"]
     template_perf = snap["template_performance"]
     reply_stage = snap["reply_stage"]
+    reply_attr = snap["reply_attribution"]
+    email_coverage = snap["email_coverage"]
+    top_niches = snap["top_niches"]
+    top_countries = snap["top_countries"]
+    followup_blockers = snap["followup_blockers"]
+    timeouts_summary = snap["timeouts_summary"]
+    owner_summary = snap["owner_summary"]
+    stage_loss_summary = snap["stage_loss_summary"]
+    current_machine = snap["current_machine"]
     progress_pct = min(100, int((pricing["offers_in_window"] / 10) * 100))
     safe_mode = "ATIVO" if ops["global_safe_mode"] else "NORMAL"
     safe_class = "is-bad" if ops["global_safe_mode"] else "is-ok"
@@ -1159,6 +1614,111 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
             f"</article>"
         )
 
+    owner_cards = [
+        (
+            "Entraram",
+            f"{owner_summary['entered']['last_24h']}",
+            f"Ultimas 24h | 7 dias: {owner_summary['entered']['last_7d']}",
+            "#sec-funil",
+        ),
+        (
+            "Foram abordados",
+            f"{owner_summary['approached']['email_1']}",
+            f"1o: {owner_summary['approached']['email_1']} | 2o: {owner_summary['approached']['email_2']} | 3o: {owner_summary['approached']['email_3']}",
+            "#sec-etapas",
+        ),
+        (
+            "Responderam",
+            f"{reply_attr['human_replies_count']}",
+            f"1o: {owner_summary['responded']['email_1']} | 2o: {owner_summary['responded']['email_2']} | 3o: {owner_summary['responded']['email_3']}",
+            "#sec-etapas",
+        ),
+        (
+            "Avancaram",
+            f"{owner_summary['advanced']['consented_7d']}",
+            f"Oferta: {owner_summary['advanced']['offers_7d']} | Venda: {owner_summary['advanced']['won_7d']}",
+            "#sec-funil",
+        ),
+        (
+            "Travaram",
+            f"{owner_summary['stuck']['lead_skipped_24h'] + owner_summary['stuck']['followup_skipped_24h'] + owner_summary['stuck']['timeouts_24h']}",
+            f"Pulados: {owner_summary['stuck']['lead_skipped_24h']} | Follow-up: {owner_summary['stuck']['followup_skipped_24h']} | Timeout: {owner_summary['stuck']['timeouts_24h']}",
+            "#sec-travas",
+        ),
+    ]
+    owner_cards_html = "".join(
+        (
+            f"<a class='owner-card' href='{link}'>"
+            f"<div class='owner-label'>{_safe(label)}</div>"
+            f"<div class='owner-value'>{_safe(value)}</div>"
+            f"<div class='owner-foot'>{_safe(foot)}</div>"
+            f"</a>"
+        )
+        for label, value, foot, link in owner_cards
+    )
+
+    machine_lines_html = "".join(
+        (
+            f"<div class='machine-line'>"
+            f"<span>{_safe(item['label'])}</span>"
+            f"<span class='status-chip {_status_badge('ACTIVE' if item['status'] == 'OK' else ('PAUSED' if item['status'] == 'Atencao' else 'ERROR'))}'>{_safe(item['status'])}</span>"
+            f"</div>"
+        )
+        for item in current_machine["lines"]
+    )
+
+    stage_loss_rows = "".join(
+        (
+            f"<tr>"
+            f"<td><b>{_safe(item['label'])}</b></td>"
+            f"<td>{item['count']}</td>"
+            f"<td>{item['next_rate'] * 100:.1f}%</td>"
+            f"<td>{_safe(item['loss_reason'])}</td>"
+            f"</tr>"
+        )
+        for item in stage_loss_summary["rows"]
+    ) or "<tr><td colspan='4'>Sem dados do funil.</td></tr>"
+
+    blocker_rows = (
+        "".join(
+            f"<tr><td><b>{_safe(item['reason'])}</b></td><td>{item['count']}</td><td>Lead pulado</td></tr>"
+            for item in followup_blockers["lead_skipped_top"][:4]
+        )
+        + "".join(
+            f"<tr><td><b>{_safe(item['reason'])}</b></td><td>{item['count']}</td><td>Follow-up travado</td></tr>"
+            for item in followup_blockers["followup_skipped_top"][:4]
+        )
+        + "".join(
+            f"<tr><td><b>{_safe(item['step'])}</b></td><td>{item['count']}</td><td>Timeout</td></tr>"
+            for item in timeouts_summary["rows_24h"][:4]
+        )
+    ) or "<tr><td colspan='3'>Sem travas recentes detectadas.</td></tr>"
+
+    coverage_rows = "".join(
+        (
+            f"<tr>"
+            f"<td><b>{_safe(item['country'])}</b></td>"
+            f"<td>{item['contactable']}/{item['leads']}</td>"
+            f"<td>{item['coverage_rate'] * 100:.1f}%</td>"
+            f"</tr>"
+        )
+        for item in email_coverage["rows"][:5]
+    ) or "<tr><td colspan='3'>Sem cobertura por pais ainda.</td></tr>"
+
+    top_niche_rows = "".join(
+        (
+            f"<tr><td><b>{_safe(item['audience'])}</b></td><td>{item['sent_count']}</td><td>{item['replied_count']}</td><td>{item['reply_rate'] * 100:.1f}%</td></tr>"
+        )
+        for item in top_niches["rows"][:5]
+    ) or "<tr><td colspan='4'>Sem dados por nicho ainda.</td></tr>"
+
+    top_country_rows = "".join(
+        (
+            f"<tr><td><b>{_safe(item['country'])}</b></td><td>{item['sent_count']}</td><td>{item['replied_count']}</td><td>{item['reply_rate'] * 100:.1f}%</td></tr>"
+        )
+        for item in top_countries["rows"][:5]
+    ) or "<tr><td colspan='4'>Sem dados por pais ainda.</td></tr>"
+
     country_choices = [
         ("ALL", "Geral"),
         ("BR", "Brasil"),
@@ -1197,6 +1757,8 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     fail_rate = (es["contact_failed"] / max(1, es["contact_failed"] + es["contact_delivered"])) * 100
     if fail_rate >= 20:
         alerts.append(("warning", "Falhas de entrega elevadas", f"Falha atual: {fail_rate:.1f}% (ultimos eventos)."))
+    if owner_summary["approached"]["email_1"] >= 25 and reply_attr["human_replies_count"] == 0:
+        alerts.append(("critical", "Sem resposta humana", "O topo do funil esta andando, mas ainda nao houve resposta humana registrada."))
     if queue_backlog >= 10:
         alerts.append(("warning", "Fila Codex acumulada", f"{queue_backlog} respostas aguardando revisao."))
     if throughput["touches_1h_total"] == 0 and throughput["touches_24h_total"] > 0:
@@ -1642,6 +2204,63 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     .stage-details summary::-webkit-details-marker {{
       display:none;
     }}
+    .owner-grid {{
+      display:grid;
+      grid-template-columns: 1.8fr 1fr;
+      gap:10px;
+      margin-bottom:10px;
+    }}
+    .owner-cards {{
+      display:grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap:10px;
+    }}
+    .owner-card {{
+      display:block;
+      text-decoration:none;
+      color:inherit;
+      border:1px solid var(--line);
+      border-radius:14px;
+      background: linear-gradient(180deg, var(--card), var(--card-soft));
+      box-shadow: var(--shadow);
+      padding:12px;
+      transition: .18s ease;
+    }}
+    .owner-card:hover {{
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+    }}
+    .owner-label {{
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      font-weight: 800;
+      letter-spacing: 0.45px;
+    }}
+    .owner-value {{
+      margin-top: 5px;
+      font-size: 34px;
+      font-weight: 900;
+      line-height: 1;
+    }}
+    .owner-foot {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+    }}
+    .machine-line {{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      padding:8px 0;
+      border-bottom:1px solid var(--line);
+      font-size:13px;
+    }}
+    .machine-line:last-child {{
+      border-bottom:none;
+    }}
     .event-card {{
       border: 1px solid var(--line);
       border-radius: 10px;
@@ -1682,12 +2301,15 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     .legend .chip {{ font-weight: 700; }}
     @media (max-width: 1180px) {{
       .main-layout {{ grid-template-columns: 1fr; }}
+      .owner-grid {{ grid-template-columns: 1fr; }}
+      .owner-cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
     }}
     @media (max-width: 920px) {{
       .kpi-grid {{ grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }}
       .sub-grid {{ grid-template-columns: 1fr; }}
       .kpi-value {{ font-size: 24px; }}
       .hero h1 {{ font-size: 23px; }}
+      .owner-cards {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -1723,6 +2345,17 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     </section>
 
     <section class='alerts'>{alert_rows}</section>
+
+    <section class='owner-grid'>
+      <div class='owner-cards'>
+        {owner_cards_html}
+      </div>
+      <article class='card'>
+        <h2 class='card-title'>O que está acontecendo agora</h2>
+        <div class='muted' style='margin-bottom:8px;'>Resumo direto do estado atual da máquina.</div>
+        {machine_lines_html}
+      </article>
+    </section>
 
     <section class='kpi-grid'>
       <article class='card'>
@@ -1761,21 +2394,31 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
           <span class='pill'>Pendente: {queue['counts']['pending']}</span>
           <span class='pill'>Revisao: {queue['counts']['review_required']}</span>
         </div>
-        <div class='kpi-foot'>{queue_label}</div>
+        <div class='kpi-foot'>Respostas aguardando analise: {queue_label}</div>
       </article>
     </section>
 
-    <section class='main-layout'>
+    <section class='main-layout' id='sec-funil'>
       <div>
         <article class='card' style='margin-bottom:10px;'>
-          <h2 class='card-title'>Funil Comercial (7 dias)</h2>
+          <h2 class='card-title'>Funil executivo (7 dias)</h2>
           <div class='funnel-stack'>{funnel_rows}</div>
           <div class='legend'>
-            <span class='chip is-neutral'>Leads: {funnel['leads_7d']}</span>
-            <span class='chip is-neutral'>Consentidos: {funnel['consented_7d']}</span>
+            <span class='chip is-neutral'>Pronto para abordagem: {owner_summary['advanced']['ready_to_approach']}</span>
+            <span class='chip is-neutral'>Aguardando confirmacao: {owner_summary['advanced']['waiting_confirmation']}</span>
             <span class='chip is-neutral'>Ofertas: {funnel['offers_7d']}</span>
             <span class='chip is-ok'>Vendas: {funnel['won_7d']}</span>
-            <span class='chip is-warn'>Perdidos: {funnel['lost_7d']}</span>
+            <span class='chip is-warn'>Sem resposta ao 1o email: {owner_summary['stuck']['no_response_total']}</span>
+          </div>
+        </article>
+
+        <article class='card' style='margin-bottom:10px;'>
+          <h2 class='card-title'>Onde o funil está travando</h2>
+          <div class='scroll-table'>
+            <table>
+              <thead><tr><th>Etapa</th><th>Volume</th><th>Passagem</th><th>Principal perda</th></tr></thead>
+              <tbody>{stage_loss_rows}</tbody>
+            </table>
           </div>
         </article>
 
@@ -1798,7 +2441,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
             </table>
           </div>
         </article>
-        <article class='card' style='margin-top:10px;'>
+        <article class='card' style='margin-top:10px;' id='sec-etapas'>
           <h2 class='card-title'>Respostas por etapa de e-mail</h2>
           <div class='muted' style='margin-bottom:8px;'>Aqui você vê quantos responderam no 1º, 2º e 3º e-mail.</div>
           <div class='stage-grid'>{stage_blocks}</div>
@@ -1807,7 +2450,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
 
       <aside class='aside-stack'>
         <article class='card'>
-          <h2 class='card-title'>Saude Operacional</h2>
+          <h2 class='card-title'>Saude operacional</h2>
           <div class='scroll-table'>
             <table>
               <thead><tr><th>Canal</th><th>Status</th><th>Motivo</th></tr></thead>
@@ -1820,7 +2463,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         </article>
 
         <article class='card'>
-          <h2 class='card-title'>Revisao Codex pendente</h2>
+          <h2 class='card-title'>Respostas aguardando analise</h2>
           <div class='scroll-table'>
             <table>
               <thead><tr><th>ID</th><th>Lead</th><th>Recebido</th><th>Mensagem</th></tr></thead>
@@ -1851,8 +2494,45 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
     </section>
 
     <section class='sub-grid'>
+      <article class='card' id='sec-travas'>
+        <h2 class='card-title'>Travas reais das ultimas 24h</h2>
+        <div class='scroll-table'>
+          <table>
+            <thead><tr><th>Causa</th><th>Volume</th><th>Tipo</th></tr></thead>
+            <tbody>{blocker_rows}</tbody>
+          </table>
+        </div>
+      </article>
       <article class='card'>
-        <h2 class='card-title'>Leads por Pais</h2>
+        <h2 class='card-title'>Cobertura de email valido por pais</h2>
+        <div class='muted'>Contato valido em 7 dias: {email_coverage['contactable_7d']}/{email_coverage['leads_7d']} ({email_coverage['coverage_rate_7d'] * 100:.1f}%)</div>
+        <div class='scroll-table' style='margin-top:8px;'>
+          <table>
+            <thead><tr><th>Pais</th><th>Com email</th><th>Cobertura</th></tr></thead>
+            <tbody>{coverage_rows}</tbody>
+          </table>
+        </div>
+      </article>
+      <article class='card'>
+        <h2 class='card-title'>Top nichos por resposta</h2>
+        <div class='scroll-table'>
+          <table>
+            <thead><tr><th>Nicho</th><th>Envios</th><th>Respostas</th><th>Taxa</th></tr></thead>
+            <tbody>{top_niche_rows}</tbody>
+          </table>
+        </div>
+      </article>
+      <article class='card'>
+        <h2 class='card-title'>Top paises por resposta</h2>
+        <div class='scroll-table'>
+          <table>
+            <thead><tr><th>Pais</th><th>Envios</th><th>Respostas</th><th>Taxa</th></tr></thead>
+            <tbody>{top_country_rows}</tbody>
+          </table>
+        </div>
+      </article>
+      <article class='card'>
+        <h2 class='card-title'>Leads por pais</h2>
         <div class='scroll-table'>
           <table>
             <thead><tr><th>Pais</th><th>Leads</th><th>%</th><th>Participacao</th></tr></thead>
@@ -1861,7 +2541,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         </div>
       </article>
       <article class='card'>
-        <h2 class='card-title'>Abordagens por Canal</h2>
+        <h2 class='card-title'>Abordagens por canal</h2>
         <div class='scroll-table'>
           <table>
             <thead><tr><th>Canal</th><th>Abordagens</th><th>Volume relativo</th></tr></thead>
@@ -1880,7 +2560,7 @@ def render_dashboard_html(country_filter: str = "ALL", audience_filter: str = "A
         </div>
       </article>
       <article class='card'>
-        <h2 class='card-title'>Abordagens por Pais x Canal</h2>
+        <h2 class='card-title'>Abordagens por pais x canal</h2>
         <div class='scroll-table'>
           <table>
             <thead><tr><th>Pais</th><th>Canal</th><th>Abordagens</th><th>Forca</th></tr></thead>
