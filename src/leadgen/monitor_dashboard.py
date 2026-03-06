@@ -7,11 +7,18 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import quote_plus, unquote_plus
 
 from .config import get_config
 from .crm_store import CrmStore
+
+
+_SNAPSHOT_CACHE_TTL_SECONDS = 4.0
+_HTML_CACHE_TTL_SECONDS = 4.0
+_SNAPSHOT_CACHE: dict[tuple[str, str, str, tuple[tuple[str, int, int], ...]], tuple[float, dict[str, Any]]] = {}
+_HTML_CACHE: dict[tuple[str, str, str, tuple[tuple[str, int, int], ...]], tuple[float, str]] = {}
 
 
 def _parse_utc(value: str) -> datetime | None:
@@ -89,6 +96,22 @@ def _read_last_events(path: Path, max_lines: int = 200) -> list[dict[str, Any]]:
         except Exception:
             continue
     return out
+
+
+def _path_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return (0, 0)
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _snapshot_signature(cfg: Any) -> tuple[tuple[str, int, int], ...]:
+    return (
+        ("state_db", *_path_signature(cfg.state_db)),
+        ("ops_state_db", *_path_signature(cfg.ops_state_db)),
+        ("events_jsonl", *_path_signature(cfg.log_dir / "events.jsonl")),
+    )
 
 
 def _events_in_window(events: list[dict[str, Any]], *, hours: int | None = None, days: int | None = None) -> list[dict[str, Any]]:
@@ -1243,16 +1266,21 @@ def _compute_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
 def build_snapshot(country_filter: str = "ALL", audience_filter: str = "ALL", approach_filter: str = "ALL") -> dict[str, Any]:
     cfg = get_config()
     CrmStore(cfg.state_db)
-    events = _read_last_events(cfg.log_dir / "events.jsonl", max_lines=600)
     country = _normalize_country_filter(country_filter)
     audience = _normalize_audience_filter(audience_filter)
     approach = _normalize_approach_filter(approach_filter)
+    cache_key = (country, audience, approach, _snapshot_signature(cfg))
+    now_mono = monotonic()
+    cached = _SNAPSHOT_CACHE.get(cache_key)
+    if cached and now_mono - cached[0] <= _SNAPSHOT_CACHE_TTL_SECONDS:
+        return cached[1]
+    events = _read_last_events(cfg.log_dir / "events.jsonl", max_lines=600)
     throughput = _throughput_snapshot(cfg.state_db, events, country, audience, approach)
     funnel = _funnel_7d(cfg.state_db, country, audience, approach)
     reply_stage = _reply_stage_snapshot(cfg.state_db, country, audience, approach)
     reply_attr = _reply_attribution_snapshot(cfg.state_db, country, audience, approach)
     email_coverage = _email_coverage_snapshot(cfg.state_db, country, audience, approach)
-    return {
+    snapshot = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "db": _db_counts(cfg.state_db, country, audience, approach),
         "ops": _ops_snapshot(cfg.ops_state_db),
@@ -1282,6 +1310,12 @@ def build_snapshot(country_filter: str = "ALL", audience_filter: str = "ALL", ap
         "events_summary": _compute_event_summary(events),
         "events": events[-50:],
     }
+    _SNAPSHOT_CACHE[cache_key] = (now_mono, snapshot)
+    if len(_SNAPSHOT_CACHE) > 24:
+        stale_keys = [key for key, (ts, _) in _SNAPSHOT_CACHE.items() if now_mono - ts > (_SNAPSHOT_CACHE_TTL_SECONDS * 4)]
+        for key in stale_keys:
+            _SNAPSHOT_CACHE.pop(key, None)
+    return snapshot
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1343,11 +1377,24 @@ def render_dashboard_html(
     audience_filter: str = "ALL",
     approach_filter: str = "ALL",
 ) -> str:
-    snap = snapshot or build_snapshot(
-        country_filter=country_filter,
-        audience_filter=audience_filter,
-        approach_filter=approach_filter,
-    )
+    cache_key: tuple[str, str, str, tuple[tuple[str, int, int], ...]] | None = None
+    now_mono = monotonic()
+    if snapshot is None:
+        cfg = get_config()
+        country = _normalize_country_filter(country_filter)
+        audience = _normalize_audience_filter(audience_filter)
+        approach = _normalize_approach_filter(approach_filter)
+        cache_key = (country, audience, approach, _snapshot_signature(cfg))
+        cached = _HTML_CACHE.get(cache_key)
+        if cached and now_mono - cached[0] <= _HTML_CACHE_TTL_SECONDS:
+            return cached[1]
+        snap = build_snapshot(
+            country_filter=country,
+            audience_filter=audience,
+            approach_filter=approach,
+        )
+    else:
+        snap = snapshot
     pricing = snap["pricing"]
     funnel = snap["funnel_7d"]
     queue = snap["reply_queue"]
@@ -1800,7 +1847,7 @@ def render_dashboard_html(
     if not event_feed:
         event_feed = "<div class='muted'>Sem eventos ainda.</div>"
 
-    return f"""<!doctype html>
+    html_out = f"""<!doctype html>
 <html lang='pt-BR'>
 <head>
   <meta charset='utf-8'/>
@@ -2591,6 +2638,13 @@ def render_dashboard_html(
   </script>
 </body>
 </html>"""
+    if cache_key is not None:
+        _HTML_CACHE[cache_key] = (now_mono, html_out)
+        if len(_HTML_CACHE) > 24:
+            stale_keys = [key for key, (ts, _) in _HTML_CACHE.items() if now_mono - ts > (_HTML_CACHE_TTL_SECONDS * 4)]
+            for key in stale_keys:
+                _HTML_CACHE.pop(key, None)
+    return html_out
 
 
 def run_dashboard(host: str = "0.0.0.0", port: int = 8789) -> None:
